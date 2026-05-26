@@ -41,37 +41,12 @@ python run_experiments_v2.py   # v2 experiments → results_v2/
 
 ```
 experiments/
-├── run_experiments.py         # v1: original experiment pipeline
 ├── run_experiments_v2.py      # v2: expanded experiments (imports from v1)
-├── results/                   # v1 output (figs, csv, tables)
-├── results_v2/                # v2 output (figs, csv, tables used in paper)
-│   ├── fig1_end_to_end_calibration.pdf
-│   ├── fig2_markovization_learned.pdf
-│   ├── fig3_rates_slopes.pdf
-│   ├── fig4_anchor_reference.pdf
-│   ├── fig5_trajectory_real.pdf
-│   ├── fig6_dynamic_transfer_learned.pdf
-│   ├── fig7_ablation_heatmap.pdf
-│   ├── fig8_runtime_scalability.pdf
-│   ├── table1_theory_map.tex
-│   ├── table2_models.tex
-│   ├── table3_method_comparison.tex
-│   ├── table4_ablation.tex
-│   ├── table5_rate_slopes.tex
-│   └── table6_thinning_effective_sample.tex
 ├── requirements.txt
 └── README.md
 ```
 
 ## Key Components
-
-### `run_experiments.py` (v1)
-Core library functions:
-- `normal_pdf`, `tv_equal_variance_normal`: Gaussian kernel utilities
-- `row_markovize`: Markovization operator (Theorem 2 in paper)
-- `finite_tv`, `stationary_dist`, `rollout_tv`, `occupation_tv`: Finite-state dynamics metrics
-- `random_sparse_chain`, `estimate_finite_kernel`: Finite-state experiment infrastructure
-- `sample_finite_transitions`: Trajectory sampling
 
 ### `run_experiments_v2.py` (v2)
 Extended experiments with neural contrastive training:
@@ -100,19 +75,6 @@ All figures and tables in the paper are generated from `results_v2/`:
 - Neural networks are trained with simple gradient descent (no GPU required for these synthetic experiments)
 - Runtime experiments report wall-clock times on a single CPU core
 - Results are deterministic given the same numpy/matplotlib versions
-
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@article{doeblin2026anchored,
-  title={Doeblin-Anchored Contrastive Learning for Markov Transition Kernels},
-  author={Anonymous},
-  journal={Submitted to JMLR},
-  year={2026}
-}
-```
 
 ## License
 
