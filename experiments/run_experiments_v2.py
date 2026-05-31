@@ -116,8 +116,10 @@ def sample_kernel(rng, X, model="smooth", sigma=0.07):
 def sample_reference(rng, n, ref="uniform", marginal_samples=None, bandwidth=0.055):
     if ref == "uniform" or marginal_samples is None and ref in ("empirical-kde", "mixture"):
         return rng.rand(n, 1)
-    if ref == "mismatched":
-        return rng.beta(2.0, 8.0, size=(n, 1))
+    if ref == "poor-coverage":
+        mask = rng.rand(n, 1) < 0.10
+        beta = rng.beta(2.0, 8.0, size=(n, 1))
+        return np.where(mask, rng.rand(n, 1), beta)
     if ref == "empirical-kde":
         idx = rng.randint(0, marginal_samples.shape[0], size=n)
         return (marginal_samples[idx] + bandwidth * rng.randn(n, 1)) % 1.0
@@ -133,8 +135,8 @@ def ref_density(Y, ref="uniform", marginal_samples=None, bandwidth=0.055):
     y = np.asarray(Y)[..., 0]
     if ref == "uniform" or marginal_samples is None and ref in ("empirical-kde", "mixture"):
         return np.ones_like(y, dtype=float)
-    if ref == "mismatched":
-        return beta28_pdf(y)
+    if ref == "poor-coverage":
+        return 0.10 + 0.90 * beta28_pdf(y)
     if ref == "empirical-kde":
         return kde_wrapped_density(y, marginal_samples, bandwidth=bandwidth).reshape(y.shape)
     if ref == "mixture":
@@ -296,6 +298,24 @@ def build_contrastive_data(rng, n, model="smooth", sigma=0.07, eps=0.1, tau=5,
     return Z, labels
 
 
+def logistic_loss_from_logits(logits, labels):
+    return float(np.mean(np.logaddexp(0.0, logits) - labels * logits))
+
+
+def heldout_contrastive_excess(net, seed, n_val=20000, model="smooth", sigma=0.07,
+                               eps=0.1, tau=5, ref="uniform", marginal_samples=None):
+    rng = np.random.RandomState(seed)
+    Z, labels = build_contrastive_data(rng, n_val, model, sigma, eps, tau, ref, marginal_samples)
+    logits_hat = np.clip(net.predict_logit(Z), -8.0, 8.0)
+    X = Z[:, 0:1]
+    Y = Z[:, 1:2]
+    r = ref_density(Y, ref=ref, marginal_samples=marginal_samples)
+    k = true_density_1d(X, Y[:, 0], model=model, sigma=sigma)
+    a0 = (1 - eps) * k + eps * r
+    logits_oracle = np.log(np.maximum(a0, 1e-12) / np.maximum(tau * r, 1e-12))
+    return logistic_loss_from_logits(logits_hat, labels) - logistic_loss_from_logits(logits_oracle, labels)
+
+
 def train_score(seed, n, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="uniform",
                 width=32, depth=2, epochs=None, marginal_samples=None):
     rng = np.random.RandomState(seed)
@@ -355,6 +375,34 @@ def grid_quantities(net, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="unifor
     }
 
 
+def timed_grid_pipeline(net, model="smooth", sigma=0.07, eps=0.1, tau=5,
+                        nx=42, ny=42, ref="uniform", marginal_samples=None):
+    x = np.linspace(0.005, 0.995, nx)[:, None]
+    y = np.linspace(0.005, 0.995, ny)[:, None]
+    dy = float(y[1] - y[0])
+    Xg = np.repeat(x, ny, axis=0)
+    Yg = np.tile(y, (nx, 1))
+    feats = np.hstack([Xg, Yg])
+    t0 = time.perf_counter()
+    logits = np.clip(net.predict_logit(feats), -8.0, 8.0).reshape(nx, ny)
+    score_time = time.perf_counter() - t0
+    r = ref_density(Yg.reshape(nx, ny, 1), ref=ref, marginal_samples=marginal_samples)
+    t1 = time.perf_counter()
+    ahat = tau * r * np.exp(logits)
+    raw = (ahat - eps * r) / max(1 - eps, 1e-8)
+    deanchor_time = time.perf_counter() - t1
+    t2 = time.perf_counter()
+    khat = row_markovize_density(raw, dy)
+    mark_time = time.perf_counter() - t2
+    t3 = time.perf_counter()
+    ktrue = true_density_1d(Xg, Yg[:, 0], model=model, sigma=sigma).reshape(nx, ny)
+    tv = float(np.mean(0.5 * np.sum(np.abs(khat - ktrue), axis=1) * dy))
+    neg = float(np.mean(np.sum(np.maximum(-raw, 0.0), axis=1) * dy))
+    rowerr = float(np.mean(np.abs(np.sum(raw, axis=1) * dy - 1.0)))
+    metric_time = time.perf_counter() - t3
+    return score_time, deanchor_time, mark_time, metric_time, tv, neg, rowerr
+
+
 def gaussian_cde_baseline(seed=0, n=5000, model="smooth", sigma=0.07, nx=54, ny=54):
     rng = np.random.RandomState(seed)
     X = rng.rand(n, 1)
@@ -401,9 +449,14 @@ def exp1_end_to_end(seeds):
             for seed in range(seeds):
                 net, rt = train_score(10000 + seed + n + len(model), n, model=model, sigma=sigma)
                 met = grid_quantities(net, model=model, sigma=sigma)
-                rows.append((model, n, seed, rt, met["excess"], met["a_l2"], met["k_l2"], met["tv"]))
-    write_csv("exp1_end_to_end.csv", ["model", "n", "seed", "runtime", "excess", "a_l2", "k_l2", "tv"], rows)
-    arr = np.array([[r[4], r[5], r[6]] for r in rows], dtype=float)
+                val_excess = heldout_contrastive_excess(
+                    net, 15000 + seed + n + len(model), n_val=12000, model=model, sigma=sigma
+                )
+                rows.append((model, n, seed, rt, val_excess, met["excess"], met["a_l2"], met["k_l2"], met["tv"]))
+    write_csv("exp1_end_to_end.csv",
+              ["model", "n", "seed", "runtime", "val_excess", "oracle_grid_excess", "a_l2", "k_l2", "tv"],
+              rows)
+    arr = np.array([[max(r[4], 1e-8), r[6], r[7]] for r in rows], dtype=float)
     fig, ax = plt.subplots(figsize=(5.5, 3.8))
     ax.scatter(arr[:, 0], arr[:, 1], s=16, alpha=0.58, label=r"$\|\hat a-a_0\|_2^2$")
     ax.scatter(arr[:, 0], arr[:, 2], s=16, alpha=0.58, label=r"$\|\tilde k-k_0\|_2^2$")
@@ -544,7 +597,7 @@ def exp3_rates_real(seeds):
 def exp4_anchor_reference(seeds):
     rows = []
     eps_list = [0.01, 0.03, 0.05, 0.1, 0.2, 0.4, 0.7]
-    refs = ["uniform", "mismatched", "empirical-kde", "mixture"]
+    refs = ["uniform", "poor-coverage", "empirical-kde", "mixture"]
     pool_rng = np.random.RandomState(501)
     Xpool = pool_rng.rand(2500, 1)
     Ypool = sample_kernel(pool_rng, Xpool, model="smooth", sigma=0.07)
@@ -702,7 +755,7 @@ def exp6_dynamic_learned(seeds):
             piL = piL / piL.sum()
             dinf = np.max(0.5 * np.sum(np.abs(K - L), axis=1))
             stat_rows.append((alpha, 1.0 / alpha, dinf / alpha, float(0.5 * np.abs(piK - piL).sum())))
-    write_csv("exp6_dynamic_learned.csv", ["n", "epsilon", "seed", "kernel_tv", "path10_tv", "occ10_tv"] + ["roll_%d" % h for h in horizons], rows)
+    write_csv("exp6_dynamic_learned.csv", ["n", "epsilon", "seed", "kernel_tv", "path10_tv_upper", "occ10_tv"] + ["roll_%d" % h for h in horizons], rows)
     write_csv("exp6_rare.csv", ["delta", "design_tv", "one_step_rollout_tv"], rare_rows)
     write_csv("exp6_stationary.csv", ["alpha", "amplification", "bound_proxy", "stationary_tv"], stat_rows)
     fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.25))
@@ -748,13 +801,13 @@ def exp6_dynamic_learned(seeds):
 def exp7_ablation(seeds):
     variants = [
         ("Ours", 0.1, "uniform", True, True, 5, 32, True),
-        ("no-anchor", 0.0, "uniform", True, True, 5, 32, True),
+        ("unanchored", 0.0, "uniform", True, True, 5, 32, True),
         ("no-deanchor", 0.1, "uniform", False, True, 5, 32, True),
         ("no-Markov", 0.1, "uniform", True, False, 5, 32, False),
-        ("wrong-reference", 0.1, "mismatched", True, True, 5, 32, True),
+        ("poor-coverage-reference", 0.1, "poor-coverage", True, True, 5, 32, True),
         ("small-eps", 0.01, "uniform", True, True, 5, 32, True),
         ("large-eps", 0.7, "uniform", True, True, 5, 32, True),
-        ("no-validation", 0.1, "uniform", True, True, 5, 16, True),
+        ("small-network", 0.1, "uniform", True, True, 5, 16, True),
         ("few-negatives", 0.1, "uniform", True, True, 1, 32, True),
         ("many-negatives", 0.1, "uniform", True, True, 15, 32, True),
     ]
@@ -763,10 +816,9 @@ def exp7_ablation(seeds):
     for name, eps, ref, deanchor, markov, tau, width, rollout_ok in variants:
         vals = []
         for seed in range(seeds):
-            ep_eff = max(eps, 1e-5)
             net, _ = train_score(70000 + seed + len(name), 3200, model="multimodal", sigma=0.06,
-                                 eps=ep_eff, tau=tau, ref=ref, width=width, depth=2, epochs=7)
-            met = grid_quantities(net, model="multimodal", sigma=0.06, eps=ep_eff, tau=tau, ref=ref,
+                                 eps=eps, tau=tau, ref=ref, width=width, depth=2, epochs=7)
+            met = grid_quantities(net, model="multimodal", sigma=0.06, eps=eps, tau=tau, ref=ref,
                                   markovize=markov, deanchor=deanchor, nx=54, ny=54)
             if rollout_ok:
                 roll = rollout_tv(met["Ptrue"], met["Pmark"], xi, [10])[0]
@@ -817,20 +869,22 @@ def exp8_runtime():
             t1 = time.perf_counter()
             net.fit(Z, labels, epochs=5, batch_size=512, lr=2e-3)
             train_time = time.perf_counter() - t1
-            t2 = time.perf_counter()
-            met = grid_quantities(net, model="smooth", sigma=0.07, eps=0.1, tau=tau, nx=42, ny=42)
-            eval_total = time.perf_counter() - t2
-            t3 = time.perf_counter()
-            _ = row_markovize_prob(met["Phat"])
-            mark_time = time.perf_counter() - t3
-            rows.append(("continuous", n, tau, data_time, train_time, mark_time, max(eval_total - mark_time, 0.0)))
+            score_time, deanchor_time, mark_time, metric_time, _, _, _ = timed_grid_pipeline(
+                net, model="smooth", sigma=0.07, eps=0.1, tau=tau, nx=42, ny=42
+            )
+            total_eval = score_time + deanchor_time + mark_time + metric_time
+            rows.append(("continuous", n, tau, data_time, train_time, score_time,
+                         deanchor_time, mark_time, metric_time, total_eval))
     for S in [50, 100, 200, 500]:
         K = np.ones((S, S)) / S
         t0 = time.perf_counter()
         _ = row_markovize_prob(K + 0.001 * np.random.randn(S, S))
         mt = time.perf_counter() - t0
-        rows.append(("finite", S, 0, 0.0, 0.0, mt, 0.0))
-    write_csv("exp8_runtime.csv", ["setting", "size", "negatives", "data_time", "training_time", "markovization_time", "evaluation_time"], rows)
+        rows.append(("finite", S, 0, 0.0, 0.0, 0.0, 0.0, mt, 0.0, mt))
+    write_csv("exp8_runtime.csv",
+              ["setting", "size", "negatives", "data_time", "training_time",
+               "score_eval_time", "deanchor_time", "markovization_time",
+               "metric_time", "total_eval_time"], rows)
     fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.25))
     continuous = [r for r in rows if r[0] == "continuous"]
     for tau in [3, 5, 10]:
@@ -846,7 +900,10 @@ def exp8_runtime():
     data_vals, train_vals, mark_vals, eval_vals = [], [], [], []
     for _, n, tau in reps:
         match = [r for r in rows if r[0] == "continuous" and r[1] == n and r[2] == tau][0]
-        data_vals.append(match[3]); train_vals.append(match[4]); mark_vals.append(match[5]); eval_vals.append(match[6])
+        data_vals.append(match[3])
+        train_vals.append(match[4])
+        mark_vals.append(match[7])
+        eval_vals.append(match[5] + match[6] + match[8])
     axes[1].bar(x, data_vals, label="data", color="#B279A2")
     axes[1].bar(x, train_vals, bottom=data_vals, label="training", color="#4C78A8")
     axes[1].bar(x, eval_vals, bottom=np.array(data_vals) + np.array(train_vals), label="evaluation", color="#72B7B2")
@@ -857,7 +914,7 @@ def exp8_runtime():
     axes[1].set_title("measured time decomposition")
     axes[1].legend(frameon=False, fontsize=6.5)
     finite = [r for r in rows if r[0] == "finite"]
-    axes[2].plot([r[1] for r in finite], [r[5] for r in finite], marker="o", color="#F58518")
+    axes[2].plot([r[1] for r in finite], [r[7] for r in finite], marker="o", color="#F58518")
     axes[2].set_xscale("log"); axes[2].set_yscale("log")
     axes[2].set_xlabel("states S"); axes[2].set_ylabel("seconds")
     axes[2].set_title("measured finite-state Markovization")
@@ -884,8 +941,8 @@ Markovization & valid kernel reconstruction & NegMass, RowErr, $R_M$\\
 Rates & H\"older--ReLU oracle diagnostic & trained 1D TV rate\\
 Anchor & anchor/de-anchor tradeoff & TV, excess, invalidity\\
 Trajectory & thinning interface stress test & held-out TV and risk\\
-Dynamics & finite-horizon transfer and coverage & rollout, path, occupation TV\\
-Ablation & component necessity and final validity & validity, TV, rollout\\
+Dynamics & finite-horizon transfer and coverage & rollout TV, occupation TV, path-law TV upper bound\\
+Ablation & component necessity and final validity & numerical validity, theory coverage, TV, rollout\\
 Runtime & measured implementation cost & wall-clock components\\
 \bottomrule
 \end{tabular}
@@ -903,7 +960,7 @@ Module & Synthetic models & Main parameters\\
 Calibration & smooth, multimodal, rough wrapped-normal kernels & $n=800$--$6400$, %d seeds\\
 Markovization & trained contrastive scores & $n=1000$--$6400$\\
 Rates & real-trained one-dimensional smoothness models & $n=800$--$10000$\\
-Anchor & four matched sampler/density reference laws & $\varepsilon=0.01$--$0.7$\\
+Anchor & matched sampler/density reference laws, including a poor-coverage stress test & $\varepsilon=0.01$--$0.7$\\
 Trajectory & single-chain and i.i.d. finite transitions & $\alpha=0.02$--$0.5$, $q=1$--$100$\\
 Dynamics & learned contrastive kernels and rare-state failures & horizons $1$--$50$\\
 \bottomrule
@@ -924,36 +981,43 @@ Dynamics & learned contrastive kernels and rare-state failures & horizons $1$--$
     lookup = {r[0]: r for r in exp7}
     gb_tv, gb_roll = gaussian_cde_baseline(seed=123, model="multimodal", sigma=0.06)
     rows = [
-        ("Ours", "full interface", "Yes", lookup["Ours"][2], lookup["Ours"][5]),
-        ("Ours-noMarkov", "score without repair", "No", lookup["no-Markov"][2], None),
-        ("Anchored-noDeanchor", "wrong target kernel", r"Yes, $A_{\eps,\nu}K_0$", lookup["no-deanchor"][2], lookup["no-deanchor"][5]),
-        ("Unanchored-NCE", "accurate but no restart chart", "no guarantee", lookup["no-anchor"][2], lookup["no-anchor"][5]),
-        ("Gaussian-CDE", "row-normalized baseline", "Yes", gb_tv, gb_roll),
+        ("Ours", "full interface", "Yes", "Yes", lookup["Ours"][2], lookup["Ours"][5]),
+        ("Ours-noMarkov", "score without repair", "No", "No", lookup["no-Markov"][2], None),
+        ("Anchored-noDeanchor", "wrong target kernel", "Yes", r"No: targets $A_{\eps,\nu}K_0$", lookup["no-deanchor"][2], lookup["no-deanchor"][5]),
+        ("Unanchored-NCE", "accurate but no restart chart", "Yes, after Markovization", "No", lookup["unanchored"][2], lookup["unanchored"][5]),
+        ("Gaussian-CDE", "row-normalized baseline", "Yes", "No", gb_tv, gb_roll),
     ]
-    lines = [r"\begin{table}[t]", r"\centering", r"\footnotesize", r"\begin{tabular}{llccc}", r"\toprule",
-             r"Method & Role & Final valid? & $d_{\mu,\mathrm{TV}}$ & rollout TV\\", r"\midrule"]
-    for name, role, valid, tv, rollout in rows:
-        lines.append("%s & %s & %s & %s & %s\\\\" % (name, role, valid, fmt(tv), fmt(rollout)))
-    lines += [r"\bottomrule", r"\end{tabular}",
-              r"\caption{Interface-oriented method comparison after end-to-end training.  Gaussian-CDE is a row-normalized circular Gaussian regression baseline trained on the same synthetic transition law.  No-Markov is not rolled out because it is not a valid transition kernel.}",
+    lines = [r"\begin{table}[t]", r"\centering", r"\footnotesize", r"\resizebox{\textwidth}{!}{%", r"\begin{tabular}{llcccc}", r"\toprule",
+             r"Method & Role & Numerically valid? & Covered by chart theory? & $d_{\mu,\mathrm{TV}}$ & rollout TV\\", r"\midrule"]
+    for name, role, numerical, theory, tv, rollout in rows:
+        lines.append("%s & %s & %s & %s & %s & %s\\\\" % (name, role, numerical, theory, fmt(tv), fmt(rollout)))
+    lines += [r"\bottomrule", r"\end{tabular}", r"}",
+              r"\caption{Interface-oriented method comparison after end-to-end training.  Numerical validity records whether the evaluated object is a transition kernel; theory coverage records whether the estimator is covered by the anchored-chart reconstruction theory.  Gaussian-CDE is a row-normalized circular Gaussian regression baseline.  No-Markov is not rolled out because it is not a valid transition kernel.}",
               r"\label{tab:method-comparison}", r"\end{table}"]
     with open(os.path.join(V2, "table3_method_comparison.tex"), "w") as f:
         f.write("\n".join(lines))
-    valid = {
-        "Ours": "Yes", "no-anchor": "no guarantee", "no-deanchor": "Yes, wrong kernel",
-        "no-Markov": "No", "wrong-reference": "Yes", "small-eps": "Yes",
-        "large-eps": "Yes", "no-validation": "Yes", "few-negatives": "Yes",
+    numerical = {
+        "Ours": "Yes", "unanchored": "Yes", "no-deanchor": "Yes",
+        "no-Markov": "No", "poor-coverage-reference": "Yes", "small-eps": "Yes",
+        "large-eps": "Yes", "small-network": "Yes", "few-negatives": "Yes",
         "many-negatives": "Yes",
     }
-    lines = [r"\begin{table}[t]", r"\centering", r"\footnotesize", r"\begin{tabular}{lcccccc}", r"\toprule",
-             r"Variant & Excess & TV & Pre-M NegMass & Pre-M RowErr & Final valid? & RolloutTV\\", r"\midrule"]
+    theory_cov = {
+        "Ours": "Yes", "unanchored": "No", "no-deanchor": "No: wrong target",
+        "no-Markov": "No", "poor-coverage-reference": "stress test", "small-eps": "Yes",
+        "large-eps": "Yes", "small-network": "Yes", "few-negatives": "Yes",
+        "many-negatives": "Yes",
+    }
+    lines = [r"\begin{table}[t]", r"\centering", r"\footnotesize", r"\resizebox{\textwidth}{!}{%", r"\begin{tabular}{lccccccc}", r"\toprule",
+             r"Variant & Excess & TV & Pre-M NegMass & Pre-M RowErr & Num. valid? & Theory? & RolloutTV\\", r"\midrule"]
     for r in exp7:
-        neg = "N/A" if r[0] in ("no-anchor", "no-deanchor") else fmt(r[3])
+        neg = "N/A" if r[0] == "no-deanchor" else fmt(r[3])
         row = "N/A" if r[0] == "no-deanchor" else fmt(r[4])
-        lines.append("%s & %s & %s & %s & %s & %s & %s\\\\" %
-                     (r[0], fmt(r[1]), fmt(r[2]), neg, row, valid.get(r[0], "Yes"), fmt(r[5])))
-    lines += [r"\bottomrule", r"\end{tabular}",
-              r"\caption{Ablation summary from real-trained variants.  Pre-M NegMass and Pre-M RowErr refer only to the de-anchored score before Markovization.  N/A means that the corresponding pre-Markovization diagnostic or rollout is not defined for that ablation.  The no-Markov row is not rolled out because it is not a valid transition kernel.}",
+        lines.append("%s & %s & %s & %s & %s & %s & %s & %s\\\\" %
+                     (r[0], fmt(r[1]), fmt(r[2]), neg, row,
+                      numerical.get(r[0], "Yes"), theory_cov.get(r[0], "Yes"), fmt(r[5])))
+    lines += [r"\bottomrule", r"\end{tabular}", r"}",
+              r"\caption{Ablation summary from real-trained variants.  Pre-M NegMass and Pre-M RowErr refer only to the de-anchored score before Markovization.  N/A means that the corresponding pre-Markovization diagnostic or rollout is not defined for that ablation.  Numerical validity is separated from coverage by the anchored-chart theory.  The no-Markov row is not rolled out because it is not a valid transition kernel.}",
               r"\label{tab:ablation-summary}", r"\end{table}"]
     with open(os.path.join(V2, "table4_ablation.tex"), "w") as f:
         f.write("\n".join(lines))
