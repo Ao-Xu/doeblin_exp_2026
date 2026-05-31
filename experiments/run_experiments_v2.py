@@ -770,7 +770,7 @@ Dynamics & learned finite kernels and rare-state failures & horizons $1$--$50$\\
     for name, r in rows:
         lines.append("%s & %.3g & %.3g & %.3g & %.3g & %.3g\\\\" % (name, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
     lines += [r"\bottomrule", r"\end{tabular}",
-              r"\caption{Low-dimensional reference comparison.}",
+              r"\caption{Representative method comparison.  Values are averages over the simulation seeds for the main continuous setting unless the method is an analytic oracle or histogram baseline.}",
               r"\label{tab:method-comparison}", r"\end{table}"]
     with open(os.path.join(V2, "table3_method_comparison.tex"), "w") as f:
         f.write("\n".join(lines))
