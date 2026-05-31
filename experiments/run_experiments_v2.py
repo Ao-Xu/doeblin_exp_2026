@@ -1,23 +1,23 @@
-import os
-import time
-import json
+import argparse
 import math
+import os
+import shutil
+import time
+
 import numpy as np
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from run_experiments import (
-    OUT, normal_pdf, tv_equal_variance_normal, row_markovize, finite_tv,
-    stationary_dist, random_sparse_chain, estimate_finite_kernel,
-    sample_finite_transitions, rollout_tv, occupation_tv
-)
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+V2 = os.path.join(ROOT, "results_v2")
 
 
-V2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results_v2")
-if not os.path.exists(V2):
-    os.makedirs(V2)
+def ensure_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
 
 
 def style():
@@ -25,21 +25,194 @@ def style():
         "font.size": 8.5,
         "axes.titlesize": 9.5,
         "axes.labelsize": 8.5,
-        "legend.fontsize": 7.5,
+        "legend.fontsize": 7.2,
         "figure.figsize": (6.0, 3.6),
         "axes.grid": True,
         "grid.alpha": 0.25,
     })
 
 
+def write_csv(name, header, rows):
+    path = os.path.join(V2, name)
+    with open(path, "w", newline="") as f:
+        f.write(",".join(header) + "\n")
+        for row in rows:
+            f.write(",".join("" if x is None else str(x) for x in row) + "\n")
+
+
+def savefig(fig, name):
+    fig.tight_layout()
+    fig.savefig(os.path.join(V2, name))
+    plt.close(fig)
+
+
 def sigmoid(z):
-    z = np.clip(z, -30, 30)
-    return 1.0 / (1.0 + np.exp(-z))
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+
+
+def normal_pdf(z, sigma):
+    return np.exp(-0.5 * (z / sigma) ** 2) / (math.sqrt(2 * math.pi) * sigma)
+
+
+def wrapped_normal_pdf(y, m, sigma):
+    out = np.zeros_like(y, dtype=float)
+    for shift in [-1.0, 0.0, 1.0]:
+        out += normal_pdf(y - m + shift, sigma)
+    return out
+
+
+def beta28_pdf(y):
+    y = np.clip(y, 1e-8, 1 - 1e-8)
+    return 72.0 * y * (1 - y) ** 7
+
+
+def kde_wrapped_density(y, samples, bandwidth=0.055, batch=4096):
+    y = np.asarray(y).reshape(-1)
+    samples = np.asarray(samples).reshape(-1)
+    out = []
+    for start in range(0, y.size, batch):
+        yy = y[start:start + batch, None]
+        val = np.zeros((yy.shape[0], samples.size))
+        for shift in [-1.0, 0.0, 1.0]:
+            val += normal_pdf(yy - samples[None, :] + shift, bandwidth)
+        out.append(val.mean(axis=1))
+    return np.concatenate(out).reshape(np.asarray(y).shape)
+
+
+def m_fun(X, model="smooth"):
+    x = X[..., 0]
+    if model == "smooth":
+        m = 0.5 + 0.25 * np.sin(2 * np.pi * x)
+    elif model == "rough":
+        m = 0.5 + 0.22 * np.tanh(10 * (x - 0.5)) + 0.08 * np.sin(10 * np.pi * x)
+    elif model == "multimodal1":
+        m = 0.35 + 0.20 * np.sin(2 * np.pi * x)
+    elif model == "multimodal2":
+        m = 0.65 - 0.20 * np.sin(2 * np.pi * x)
+    else:
+        m = 0.5 + 0.25 * np.sin(2 * np.pi * x)
+    return np.clip(m, 0.03, 0.97)
+
+
+def true_density_1d(X, Y, model="smooth", sigma=0.07):
+    if model == "multimodal":
+        return (
+            0.5 * wrapped_normal_pdf(Y, m_fun(X, "multimodal1"), sigma)
+            + 0.5 * wrapped_normal_pdf(Y, m_fun(X, "multimodal2"), sigma)
+        )
+    return wrapped_normal_pdf(Y, m_fun(X, model), sigma)
+
+
+def sample_kernel(rng, X, model="smooth", sigma=0.07):
+    n = X.shape[0]
+    if model == "multimodal":
+        comp = rng.rand(n) < 0.5
+        mean = np.where(comp, m_fun(X, "multimodal1"), m_fun(X, "multimodal2"))
+    else:
+        mean = m_fun(X, model)
+    return ((mean + sigma * rng.randn(n)) % 1.0)[:, None]
+
+
+def sample_reference(rng, n, ref="uniform", marginal_samples=None, bandwidth=0.055):
+    if ref == "uniform" or marginal_samples is None and ref in ("empirical-kde", "mixture"):
+        return rng.rand(n, 1)
+    if ref == "mismatched":
+        return rng.beta(2.0, 8.0, size=(n, 1))
+    if ref == "empirical-kde":
+        idx = rng.randint(0, marginal_samples.shape[0], size=n)
+        return (marginal_samples[idx] + bandwidth * rng.randn(n, 1)) % 1.0
+    if ref == "mixture":
+        mask = rng.rand(n, 1) < 0.5
+        idx = rng.randint(0, marginal_samples.shape[0], size=n)
+        kde = (marginal_samples[idx] + bandwidth * rng.randn(n, 1)) % 1.0
+        return np.where(mask, rng.rand(n, 1), kde)
+    raise ValueError("unknown reference %s" % ref)
+
+
+def ref_density(Y, ref="uniform", marginal_samples=None, bandwidth=0.055):
+    y = np.asarray(Y)[..., 0]
+    if ref == "uniform" or marginal_samples is None and ref in ("empirical-kde", "mixture"):
+        return np.ones_like(y, dtype=float)
+    if ref == "mismatched":
+        return beta28_pdf(y)
+    if ref == "empirical-kde":
+        return kde_wrapped_density(y, marginal_samples, bandwidth=bandwidth).reshape(y.shape)
+    if ref == "mixture":
+        kde = kde_wrapped_density(y, marginal_samples, bandwidth=bandwidth).reshape(y.shape)
+        return 0.5 + 0.5 * kde
+    raise ValueError("unknown reference %s" % ref)
+
+
+def row_markovize_density(density, dy):
+    positive = np.maximum(density, 0.0)
+    mass = positive.sum(axis=1, keepdims=True) * dy
+    out = np.empty_like(positive)
+    good = mass[:, 0] > 0
+    out[good] = positive[good] / mass[good]
+    out[~good] = 1.0
+    return out
+
+
+def row_markovize_prob(M, fallback=None):
+    P = np.maximum(np.asarray(M, dtype=float), 0.0)
+    row_sums = P.sum(axis=1, keepdims=True)
+    if fallback is None:
+        fallback = np.ones(P.shape[1]) / P.shape[1]
+    out = np.empty_like(P)
+    good = row_sums[:, 0] > 0
+    out[good] = P[good] / row_sums[good]
+    out[~good] = fallback[None, :]
+    return out
+
+
+def finite_tv(K, L, mu=None):
+    if mu is None:
+        mu = np.ones(K.shape[0]) / K.shape[0]
+    return float(np.sum(mu * 0.5 * np.sum(np.abs(K - L), axis=1)))
+
+
+def rollout_tv(K, L, xi, horizons):
+    out = []
+    pK = xi.copy()
+    pL = xi.copy()
+    hset = set(horizons)
+    for h in range(1, max(horizons) + 1):
+        pK = pK.dot(K)
+        pL = pL.dot(L)
+        if h in hset:
+            out.append(float(0.5 * np.abs(pK - pL).sum()))
+    return out
+
+
+def path_tv(K, L, xi, h):
+    # Exact dynamic-programming coupling upper bound for small finite grids:
+    # the occupancy perturbation sum used in the theorem.
+    e = 0.5 * np.sum(np.abs(K - L), axis=1)
+    p = xi.copy()
+    total = 0.0
+    for _ in range(h):
+        total += float(p.dot(e))
+        p = p.dot(K)
+    return min(1.0, total)
+
+
+def occupation_tv(K, L, xi, h):
+    pK = xi.copy()
+    pL = xi.copy()
+    occK = np.zeros_like(xi)
+    occL = np.zeros_like(xi)
+    for _ in range(h):
+        occK += pK
+        occL += pL
+        pK = pK.dot(K)
+        pL = pL.dot(L)
+    occK /= h
+    occL /= h
+    return float(0.5 * np.abs(occK - occL).sum())
 
 
 class ReLUContrastiveNet:
-    """Small fully connected ReLU classifier trained by Adam in NumPy."""
-    def __init__(self, input_dim, width=48, depth=2, seed=0):
+    def __init__(self, input_dim, width=32, depth=2, seed=0):
         self.rng = np.random.RandomState(seed)
         dims = [input_dim] + [width] * depth + [1]
         self.W = []
@@ -67,7 +240,7 @@ class ReLUContrastiveNet:
             out.append(z)
         return np.concatenate(out)
 
-    def fit(self, X, y, epochs=12, batch_size=512, lr=2e-3, weight_decay=1e-5):
+    def fit(self, X, y, epochs=8, batch_size=512, lr=2e-3, weight_decay=1e-5):
         n = X.shape[0]
         mW = [np.zeros_like(w) for w in self.W]
         vW = [np.zeros_like(w) for w in self.W]
@@ -101,314 +274,288 @@ class ReLUContrastiveNet:
                     vW[i] = beta2 * vW[i] + (1 - beta2) * (gW[i] ** 2)
                     mb[i] = beta1 * mb[i] + (1 - beta1) * gb[i]
                     vb[i] = beta2 * vb[i] + (1 - beta2) * (gb[i] ** 2)
-                    self.W[i] -= lr * (mW[i] / (1 - beta1 ** step)) / (np.sqrt(vW[i] / (1 - beta2 ** step)) + 1e-8)
-                    self.b[i] -= lr * (mb[i] / (1 - beta1 ** step)) / (np.sqrt(vb[i] / (1 - beta2 ** step)) + 1e-8)
+                    self.W[i] -= lr * (mW[i] / (1 - beta1 ** step)) / (
+                        np.sqrt(vW[i] / (1 - beta2 ** step)) + 1e-8
+                    )
+                    self.b[i] -= lr * (mb[i] / (1 - beta1 ** step)) / (
+                        np.sqrt(vb[i] / (1 - beta2 ** step)) + 1e-8
+                    )
 
 
-def m_fun(X, model="smooth"):
-    x = X[..., 0]
-    if model == "smooth":
-        m = 0.5 + 0.25 * np.sin(2 * np.pi * x)
-    elif model == "rough":
-        m = 0.5 + 0.22 * np.tanh(10 * (x - 0.5)) + 0.08 * np.sin(10 * np.pi * x)
-    elif model == "jump":
-        m = 0.35 + 0.30 * sigmoid(35 * (x - 0.5))
-    elif model == "mode1":
-        m = 0.35 + 0.20 * np.sin(2 * np.pi * x)
-    elif model == "mode2":
-        m = 0.65 - 0.20 * np.sin(2 * np.pi * x)
-    else:
-        m = 0.5 + 0.25 * np.sin(2 * np.pi * x)
-    if X.shape[-1] > 1:
-        extra = 0.08 * np.sin(2 * np.pi * X[..., 1:]).mean(axis=-1)
-        m = m + extra
-    return np.clip(m, 0.03, 0.97)
-
-
-def wrapped_normal_pdf(y, m, sigma):
-    out = np.zeros_like(y, dtype=float)
-    for shift in [-1.0, 0.0, 1.0]:
-        out += normal_pdf(y - m + shift, sigma)
-    return out
-
-
-def true_density_1d(X, Y, model="smooth", sigma=0.07):
-    if model == "multimodal":
-        m1 = m_fun(X, "mode1")
-        m2 = m_fun(X, "mode2")
-        return 0.5 * wrapped_normal_pdf(Y, m1, sigma) + 0.5 * wrapped_normal_pdf(Y, m2, sigma)
-    m = m_fun(X, model)
-    return wrapped_normal_pdf(Y, m, sigma)
-
-
-def sample_kernel(rng, X, model="smooth", sigma=0.07):
-    n, d = X.shape
-    if model == "multimodal":
-        comp = rng.rand(n) < 0.5
-        M = np.where(comp, m_fun(X, "mode1"), m_fun(X, "mode2"))
-    else:
-        M = m_fun(X, model)
-    y0 = (M + sigma * rng.randn(n)) % 1.0
-    if d == 1:
-        return y0[:, None]
-    Y = np.empty((n, d))
-    Y[:, 0] = y0
-    for j in range(1, d):
-        mj = 0.5 + 0.25 * np.sin(2 * np.pi * X[:, j])
-        Y[:, j] = (mj + sigma * rng.randn(n)) % 1.0
-    return Y
-
-
-def sample_reference(rng, n, d=1, ref="uniform", marginal_samples=None):
-    if ref == "mismatched":
-        Y = rng.beta(2.0, 8.0, size=(n, d))
-    elif ref == "empirical" and marginal_samples is not None:
-        idx = rng.randint(0, marginal_samples.shape[0], size=n)
-        Y = marginal_samples[idx]
-    elif ref == "mixture" and marginal_samples is not None:
-        mask = rng.rand(n, 1) < 0.5
-        idx = rng.randint(0, marginal_samples.shape[0], size=n)
-        Y = np.where(mask, rng.rand(n, d), marginal_samples[idx])
-    else:
-        Y = rng.rand(n, d)
-    return Y
-
-
-def ref_density(Y, ref="uniform", marginal_grid=None):
-    if ref == "mismatched":
-        y = np.clip(Y[..., 0], 1e-6, 1 - 1e-6)
-        # Beta(2,8) density with a small uniform floor for coverage.
-        beta = 72.0 * y * (1 - y) ** 7
-        return 0.1 + 0.9 * beta
-    return np.ones(Y.shape[:-1])
-
-
-def build_contrastive_data(rng, n, d=1, model="smooth", sigma=0.07, eps=0.1, tau=5,
+def build_contrastive_data(rng, n, model="smooth", sigma=0.07, eps=0.1, tau=5,
                            ref="uniform", marginal_samples=None):
-    X = rng.rand(n, d)
+    X = rng.rand(n, 1)
     Y_data = sample_kernel(rng, X, model=model, sigma=sigma)
-    Y_anchor = sample_reference(rng, n, d, ref=ref, marginal_samples=marginal_samples)
+    Y_anchor = sample_reference(rng, n, ref=ref, marginal_samples=marginal_samples)
     use_data = (rng.rand(n, 1) < (1 - eps))
     Y_pos = np.where(use_data, Y_data, Y_anchor)
-    X_pos = X
     X_neg = np.repeat(X, tau, axis=0)
-    Y_neg = sample_reference(rng, n * tau, d, ref=ref, marginal_samples=marginal_samples)
-    Z = np.vstack([np.hstack([X_pos, Y_pos]), np.hstack([X_neg, Y_neg])])
+    Y_neg = sample_reference(rng, n * tau, ref=ref, marginal_samples=marginal_samples)
+    Z = np.vstack([np.hstack([X, Y_pos]), np.hstack([X_neg, Y_neg])])
     labels = np.concatenate([np.ones(n), np.zeros(n * tau)])
-    return Z, labels, X, Y_data
+    return Z, labels
 
 
-def train_score(seed, n, d=1, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="uniform",
-                width=48, depth=2, epochs=None, marginal_samples=None):
+def train_score(seed, n, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="uniform",
+                width=32, depth=2, epochs=None, marginal_samples=None):
     rng = np.random.RandomState(seed)
-    Z, labels, X, Y = build_contrastive_data(rng, n, d, model, sigma, eps, tau, ref, marginal_samples)
-    net = ReLUContrastiveNet(2 * d, width=width, depth=depth, seed=seed + 17)
+    Z, labels = build_contrastive_data(rng, n, model, sigma, eps, tau, ref, marginal_samples)
+    net = ReLUContrastiveNet(2, width=width, depth=depth, seed=seed + 17)
     if epochs is None:
-        epochs = 18 if n <= 2000 else 12 if n <= 10000 else 8
+        epochs = 10 if n <= 1500 else 8 if n <= 4000 else 6
     t0 = time.time()
     net.fit(Z, labels, epochs=epochs, batch_size=512, lr=2e-3)
     runtime = time.time() - t0
-    return net, runtime, Y
+    return net, runtime
 
 
-def eval_continuous_1d(net, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="uniform",
-                       nx=70, ny=120):
+def grid_quantities(net, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="uniform",
+                    marginal_samples=None, nx=54, ny=72, markovize=True, deanchor=True):
     x = np.linspace(0.005, 0.995, nx)[:, None]
     y = np.linspace(0.005, 0.995, ny)[:, None]
+    dy = float(y[1] - y[0])
     Xg = np.repeat(x, ny, axis=0)
     Yg = np.tile(y, (nx, 1))
     feats = np.hstack([Xg, Yg])
-    logits = np.clip(net.predict_logit(feats), -7.0, 7.0).reshape(nx, ny)
-    r = ref_density(Yg.reshape(nx, ny, 1), ref=ref)
+    logits = np.clip(net.predict_logit(feats), -8.0, 8.0).reshape(nx, ny)
+    r = ref_density(Yg.reshape(nx, ny, 1), ref=ref, marginal_samples=marginal_samples)
     ahat = tau * r * np.exp(logits)
     ktrue = true_density_1d(Xg, Yg[:, 0], model=model, sigma=sigma).reshape(nx, ny)
     a0 = (1 - eps) * ktrue + eps * r
-    dy = float(y[1] - y[0])
-    tilde = (ahat - eps * r) / (1 - eps)
-    Pmark = row_markovize(tilde * dy)
-    khat = Pmark / dy
-    excess = np.mean(-a0 * np.log(np.maximum(ahat, 1e-12) / np.maximum(ahat + tau * r, 1e-12))
-                     -tau * r * np.log(np.maximum(tau * r, 1e-12) / np.maximum(ahat + tau * r, 1e-12))
-                     +a0 * np.log(np.maximum(a0, 1e-12) / np.maximum(a0 + tau * r, 1e-12))
-                     +tau * r * np.log(np.maximum(tau * r, 1e-12) / np.maximum(a0 + tau * r, 1e-12)))
+    if deanchor:
+        raw = (ahat - eps * r) / max(1 - eps, 1e-8)
+        target_density = ktrue
+    else:
+        raw = ahat
+        target_density = ktrue
+    if markovize:
+        khat = row_markovize_density(raw, dy)
+    else:
+        khat = raw
+    Ptrue = row_markovize_density(ktrue, dy) * dy
+    Pmark = row_markovize_density(raw, dy) * dy
+    Phat = khat * dy if not markovize else Pmark
+    excess = np.mean(
+        -a0 * np.log(np.maximum(ahat, 1e-12) / np.maximum(ahat + tau * r, 1e-12))
+        -tau * r * np.log(np.maximum(tau * r, 1e-12) / np.maximum(ahat + tau * r, 1e-12))
+        +a0 * np.log(np.maximum(a0, 1e-12) / np.maximum(a0 + tau * r, 1e-12))
+        +tau * r * np.log(np.maximum(tau * r, 1e-12) / np.maximum(a0 + tau * r, 1e-12))
+    )
+    neg = float(np.mean(np.sum(np.maximum(-raw, 0.0), axis=1) * dy))
+    rowerr = float(np.mean(np.abs(np.sum(raw, axis=1) * dy - 1.0)))
+    tv_pre = float(np.mean(0.5 * np.sum(np.abs(raw - target_density), axis=1) * dy))
+    tv = float(np.mean(0.5 * np.sum(np.abs(khat - target_density), axis=1) * dy))
     a_l2 = float(np.mean((ahat - a0) ** 2))
-    k_l2 = float(np.mean((tilde - ktrue) ** 2))
-    tv_pre = float(np.mean(0.5 * np.sum(np.abs(tilde - ktrue), axis=1) * dy))
-    tv = float(np.mean(0.5 * np.sum(np.abs(khat - ktrue), axis=1) * dy))
-    neg = float(np.mean(np.sum(np.maximum(-tilde, 0.0), axis=1) * dy))
-    rowerr = float(np.mean(np.abs(np.sum(tilde, axis=1) * dy - 1.0)))
-    l1_pre = float(np.mean(np.sum(np.abs(tilde - ktrue), axis=1) * dy))
-    l1_post = float(np.mean(np.sum(np.abs(khat - ktrue), axis=1) * dy))
-    ratio = l1_post / max(l1_pre, 1e-12)
-    return dict(excess=float(excess), a_l2=a_l2, k_l2=k_l2, tv=tv, tv_pre=tv_pre,
-                neg=neg, rowerr=rowerr, ratio=ratio)
+    k_l2 = float(np.mean((raw - ktrue) ** 2))
+    ratio = tv / max(tv_pre, 1e-12)
+    return {
+        "excess": float(excess), "a_l2": a_l2, "k_l2": k_l2, "tv_pre": tv_pre,
+        "tv": tv, "neg": neg, "rowerr": rowerr, "ratio": ratio,
+        "Ptrue": Ptrue, "Pmark": Pmark, "Phat": Phat, "xgrid": x[:, 0], "ygrid": y[:, 0],
+    }
 
 
-def exp1_end_to_end():
+def gaussian_cde_baseline(seed=0, n=5000, model="smooth", sigma=0.07, nx=54, ny=54):
+    rng = np.random.RandomState(seed)
+    X = rng.rand(n, 1)
+    Y = sample_kernel(rng, X, model=model, sigma=sigma)[:, 0]
+    x = X[:, 0]
+    Phi = np.column_stack([
+        np.ones(n), x, np.sin(2 * np.pi * x), np.cos(2 * np.pi * x),
+        np.sin(4 * np.pi * x), np.cos(4 * np.pi * x),
+    ])
+    target_sin = np.sin(2 * np.pi * Y)
+    target_cos = np.cos(2 * np.pi * Y)
+    ridge = 1e-4 * np.eye(Phi.shape[1])
+    bs = np.linalg.solve(Phi.T.dot(Phi) + ridge, Phi.T.dot(target_sin))
+    bc = np.linalg.solve(Phi.T.dot(Phi) + ridge, Phi.T.dot(target_cos))
+    xg = np.linspace(0.005, 0.995, nx)
+    yg = np.linspace(0.005, 0.995, ny)
+    Phig = np.column_stack([
+        np.ones(nx), xg, np.sin(2 * np.pi * xg), np.cos(2 * np.pi * xg),
+        np.sin(4 * np.pi * xg), np.cos(4 * np.pi * xg),
+    ])
+    s = Phig.dot(bs)
+    c = Phig.dot(bc)
+    mean = (np.arctan2(s, c) / (2 * np.pi)) % 1.0
+    Xmesh = np.repeat(xg[:, None], ny, axis=1)
+    Ymesh = np.repeat(yg[None, :], nx, axis=0)
+    dens = wrapped_normal_pdf(Ymesh, mean[:, None], sigma)
+    dy = yg[1] - yg[0]
+    dens = row_markovize_density(dens, dy)
+    ktrue = true_density_1d(Xmesh.reshape(-1, 1), Ymesh.reshape(-1), model, sigma).reshape(nx, ny)
+    tv = float(np.mean(0.5 * np.sum(np.abs(dens - ktrue), axis=1) * dy))
+    Ptrue = row_markovize_density(ktrue, dy) * dy
+    Phat = dens * dy
+    xi = np.ones(nx) / nx
+    roll = rollout_tv(Ptrue, Phat, xi, [10])[0]
+    return tv, roll
+
+
+def exp1_end_to_end(seeds):
     rows = []
-    models = [("smooth", 0.07), ("multimodal", 0.06), ("near-deterministic", 0.03)]
-    n_list = [500, 1000, 2000, 5000, 10000, 20000]
-    for model_name, sigma in models:
-        internal = "smooth" if model_name == "near-deterministic" else model_name
+    models = [("smooth", 0.07), ("multimodal", 0.06), ("rough", 0.07)]
+    n_list = [800, 1600, 3200, 6400]
+    for model, sigma in models:
         for n in n_list:
-            for seed in range(10):
-                net, rt, _ = train_score(10000 + seed + n, n, model=internal, sigma=sigma,
-                                         eps=0.1, width=48, depth=2)
-                met = eval_continuous_1d(net, model=internal, sigma=sigma, eps=0.1)
-                rows.append((model_name, n, seed, rt, met["excess"], met["a_l2"], met["k_l2"], met["tv"]))
+            for seed in range(seeds):
+                net, rt = train_score(10000 + seed + n + len(model), n, model=model, sigma=sigma)
+                met = grid_quantities(net, model=model, sigma=sigma)
+                rows.append((model, n, seed, rt, met["excess"], met["a_l2"], met["k_l2"], met["tv"]))
     write_csv("exp1_end_to_end.csv", ["model", "n", "seed", "runtime", "excess", "a_l2", "k_l2", "tv"], rows)
     arr = np.array([[r[4], r[5], r[6]] for r in rows], dtype=float)
     fig, ax = plt.subplots(figsize=(5.5, 3.8))
-    ax.scatter(arr[:, 0], arr[:, 1], s=15, alpha=0.55, label=r"$\|\hat a-a_0\|_2^2$")
-    ax.scatter(arr[:, 0], arr[:, 2], s=15, alpha=0.55, label=r"$\|\tilde k-k_0\|_2^2$")
-    lo, hi = np.percentile(arr[:, 0], [2, 98])
+    ax.scatter(arr[:, 0], arr[:, 1], s=16, alpha=0.58, label=r"$\|\hat a-a_0\|_2^2$")
+    ax.scatter(arr[:, 0], arr[:, 2], s=16, alpha=0.58, label=r"$\|\tilde k-k_0\|_2^2$")
+    lo, hi = np.percentile(arr[:, 0], [5, 95])
     xs = np.array([lo, hi])
-    ax.plot(xs, np.median(arr[:, 1] / arr[:, 0]) * xs, "k--", label="slope 1")
+    ax.plot(xs, np.median(arr[:, 1] / np.maximum(arr[:, 0], 1e-12)) * xs, "k--", label="slope 1")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("held-out contrastive excess risk")
     ax.set_ylabel("integrated squared error")
-    ax.set_title("End-to-end calibration across three transition regimes")
+    ax.set_title("End-to-end calibration")
     ax.legend()
     savefig(fig, "fig1_end_to_end_calibration.pdf")
     return rows
 
 
-def exp2_markovization_learned():
+def exp2_markovization_learned(seeds):
     rows = []
-    for S in [50, 100, 200]:
-        for n in [1000, 5000, 10000]:
-            for seed in range(10):
-                rng = np.random.RandomState(20000 + seed + S + n)
-                K = random_sparse_chain(rng, S=S)
-                X, Y = sample_finite_transitions(rng, K, n, iid=True)
-                Kh = estimate_finite_kernel(X, Y, S, alpha=0.05)
-                eps = 0.1
-                r = 1.0 / S
-                # A learned anchored score from finite contrastive counts.
-                ah = (1 - eps) * Kh + eps * r
-                tilde = (ah - eps * r) / (1 - eps)
-                # Add the finite-sample de-anchoring noise that a score learner produces.
-                tilde = tilde + rng.normal(0.0, 0.004 * math.sqrt(5000.0 / n), size=tilde.shape)
-                Kmark = row_markovize(tilde)
-                neg = np.mean(np.sum(np.maximum(-tilde, 0.0), axis=1))
-                rowerr = np.mean(np.abs(tilde.sum(axis=1) - 1))
-                l1_pre = np.mean(np.sum(np.abs(tilde - K), axis=1))
-                l1_post = np.mean(np.sum(np.abs(Kmark - K), axis=1))
-                ratio = l1_post / max(l1_pre, 1e-12)
-                rows.append((S, n, seed, neg, rowerr, finite_tv(K, tilde), finite_tv(K, Kmark), ratio))
-    # continuous learned scores reused from a small near-deterministic run
-    for n in [1000, 5000, 10000]:
-        for seed in range(10):
-            net, rt, _ = train_score(30000 + seed + n, n, model="smooth", sigma=0.02, eps=0.1,
-                                     width=48, depth=2)
-            met = eval_continuous_1d(net, model="smooth", sigma=0.02, eps=0.1)
-            rows.append(("cont", n, seed, met["neg"], met["rowerr"], met["tv_pre"], met["tv"], met["ratio"]))
+    for model, sigma in [("smooth", 0.07), ("rough", 0.07), ("multimodal", 0.06)]:
+        for n in [1000, 3200, 6400]:
+            for seed in range(seeds):
+                net, _ = train_score(20000 + seed + n + len(model), n, model=model, sigma=sigma)
+                met = grid_quantities(net, model=model, sigma=sigma, markovize=True)
+                rows.append((model, n, seed, met["neg"], met["rowerr"], met["tv_pre"], met["tv"], met["ratio"]))
     write_csv("exp2_markovization.csv", ["env", "n", "seed", "negmass", "rowerr", "tv_pre", "tv_post", "ratio"], rows)
-    ratios = np.array([float(r[-1]) for r in rows])
-    pre = np.array([float(r[5]) for r in rows])
-    post = np.array([float(r[6]) for r in rows])
-    neg = np.array([float(r[3]) for r in rows])
-    rowerr = np.array([float(r[4]) for r in rows])
-    envs = ["50", "100", "200", "cont"]
-    colors = {"50": "#4C78A8", "100": "#72B7B2", "200": "#F58518", "cont": "#B279A2"}
+    neg = np.array([r[3] for r in rows], dtype=float)
+    rowerr = np.array([r[4] for r in rows], dtype=float)
+    pre = np.array([r[5] for r in rows], dtype=float)
+    post = np.array([r[6] for r in rows], dtype=float)
+    ratios = np.array([r[7] for r in rows], dtype=float)
+    envs = ["smooth", "rough", "multimodal"]
+    colors = {"smooth": "#4C78A8", "rough": "#F58518", "multimodal": "#54A24B"}
+    fig, axes = plt.subplots(1, 3, figsize=(11.6, 3.35))
 
-    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.25))
-
-    means = [neg.mean(), rowerr.mean()]
-    ses = [neg.std() / math.sqrt(len(neg)), rowerr.std() / math.sqrt(len(rowerr))]
-    x0 = np.arange(2)
-    axes[0].bar(x0, means, yerr=ses, color="#4C78A8", width=0.55, capsize=3, label="before")
-    axes[0].scatter(x0 + 0.26, [0, 0], marker="v", color="#F58518", s=35, label="after = 0")
-    axes[0].set_xticks(x0); axes[0].set_xticklabels(["NegMass", "RowErr"])
-    axes[0].set_ylabel("integrated invalidity")
-    axes[0].set_title("validity repair")
+    # Panel A: separate the small negative mass from row-sum error on a log scale.
+    floor = 5e-5
+    for i, env in enumerate(envs):
+        env_rows = [r for r in rows if r[0] == env]
+        env_neg = np.array([r[3] for r in env_rows], dtype=float)
+        env_row = np.array([r[4] for r in env_rows], dtype=float)
+        jitter = np.linspace(-0.035, 0.035, len(env_rows))
+        plot_neg = np.maximum(env_neg, floor)
+        plot_row = np.maximum(env_row, floor)
+        axes[0].scatter(i - 0.14 + jitter, plot_neg, s=22, color="#4C78A8", alpha=0.85,
+                        label="NegMass before" if i == 0 else None)
+        axes[0].scatter(i + 0.14 + jitter, plot_row, s=22, color="#E45756", alpha=0.85,
+                        label="RowErr before" if i == 0 else None)
+        axes[0].plot([i - 0.18, i - 0.10], [max(env_neg.mean(), floor), max(env_neg.mean(), floor)],
+                     color="#2F5D8C", lw=2)
+        axes[0].plot([i + 0.10, i + 0.18], [max(env_row.mean(), floor), max(env_row.mean(), floor)],
+                     color="#B83C3A", lw=2)
+    axes[0].axhline(floor, color="0.25", lw=0.8, linestyle=":")
+    axes[0].text(0.03, 0.07, "after Markovization: both exactly 0\nzeros shown at plotting floor",
+                 transform=axes[0].transAxes, fontsize=7.2)
+    axes[0].set_yscale("log")
+    axes[0].set_ylim(floor * 0.6, 0.4)
+    axes[0].set_yticks([1e-4, 1e-3, 1e-2, 1e-1])
+    axes[0].set_xticks(range(len(envs)))
+    axes[0].set_xticklabels(["smooth", "rough", "multi"])
+    axes[0].set_ylabel("invalidity diagnostic")
+    axes[0].set_title("validity violation before repair")
     axes[0].legend(frameon=False, loc="upper right")
 
-    for env in envs:
-        sub = [r for r in rows if str(r[0]) == env]
-        axes[1].scatter([float(r[5]) for r in sub], [float(r[6]) for r in sub],
-                        s=18, alpha=0.72, color=colors[env], label=env)
-    lim = max(pre.max(), post.max()) * 1.05
-    axes[1].plot([0, lim], [0, lim], "k--", linewidth=1.0, label="no change")
-    axes[1].set_xlim(0, lim); axes[1].set_ylim(0, lim)
-    axes[1].set_xlabel("TV before Markovization")
-    axes[1].set_ylabel("TV after Markovization")
-    axes[1].set_title("TV stability")
-    axes[1].legend(frameon=False, title="env", fontsize=6.5)
+    # Panel B: paired runs show that Markovization is a validity step, not a TV heuristic.
+    for i, env in enumerate(envs):
+        env_rows = [r for r in rows if r[0] == env]
+        env_pre = np.array([r[5] for r in env_rows], dtype=float)
+        env_post = np.array([r[6] for r in env_rows], dtype=float)
+        offsets = np.linspace(-0.08, 0.08, len(env_rows))
+        for j, off in enumerate(offsets):
+            axes[1].plot([i - 0.18 + off, i + 0.18 + off], [env_pre[j], env_post[j]],
+                         color="0.72", lw=0.9, zorder=1)
+        axes[1].scatter(np.full(len(env_pre), i - 0.18) + offsets, env_pre,
+                        s=20, color="#9D755D", alpha=0.85, label="pre-M" if i == 0 else None, zorder=2)
+        axes[1].scatter(np.full(len(env_post), i + 0.18) + offsets, env_post,
+                        s=20, color="#72B7B2", alpha=0.9, label="post-M" if i == 0 else None, zorder=2)
+        axes[1].plot([i - 0.22, i - 0.14], [env_pre.mean(), env_pre.mean()],
+                     color="#6F4E3B", lw=2.2)
+        axes[1].plot([i + 0.14, i + 0.22], [env_post.mean(), env_post.mean()],
+                     color="#3E8F8A", lw=2.2)
+    axes[1].set_xticks(range(len(envs)))
+    axes[1].set_xticklabels(["smooth", "rough", "multi"])
+    axes[1].set_ylabel("integrated TV")
+    axes[1].set_title("paired TV before/after")
+    axes[1].legend(frameon=False, loc="upper right")
 
-    data = [[float(r[-1]) for r in rows if str(r[0]) == env] for env in envs]
-    axes[2].boxplot(data, labels=envs, patch_artist=True,
-                    boxprops=dict(facecolor="#E6E6E6", color="#555555"),
-                    medianprops=dict(color="#D55E00", linewidth=1.4),
-                    whiskerprops=dict(color="#555555"),
-                    capprops=dict(color="#555555"))
-    for i, vals in enumerate(data, start=1):
-        jitter = np.linspace(-0.13, 0.13, len(vals))
-        axes[2].scatter(i + jitter, vals, s=10, color=colors[envs[i - 1]], alpha=0.45)
-    axes[2].axhline(1.0, color="k", linestyle="--", linewidth=1.0)
-    axes[2].set_ylim(0.65, 1.12)
-    axes[2].set_xlabel("environment")
-    axes[2].set_ylabel(r"$R_M=\|M\tilde k-k_0\|_1/\|\tilde k-k_0\|_1$")
-    axes[2].set_title(r"stability ratio")
+    # Panel C: zoom on the empirical ratio and state the loose deterministic bound.
+    for i, env in enumerate(envs):
+        env_ratios = np.array([r[7] for r in rows if r[0] == env], dtype=float)
+        jitter = np.linspace(-0.08, 0.08, len(env_ratios))
+        axes[2].scatter(i + jitter, env_ratios, s=24, color=colors[env], alpha=0.9)
+        axes[2].plot([i - 0.12, i + 0.12], [env_ratios.mean(), env_ratios.mean()],
+                     color="0.15", lw=2)
+    axes[2].axhline(1, color="0.35", linestyle=":", lw=1)
+    ymin = max(0.9, ratios.min() - 0.025)
+    ymax = min(1.08, ratios.max() + 0.025)
+    axes[2].set_ylim(ymin, ymax)
+    axes[2].text(0.02, 0.93, "deterministic bound: R_M <= 2",
+                 transform=axes[2].transAxes, fontsize=7.5)
+    axes[2].set_xticks(range(len(envs)))
+    axes[2].set_xticklabels(["smooth", "rough", "multi"])
+    axes[2].set_ylabel("repair ratio R_M")
+    axes[2].set_title("accuracy preservation")
     savefig(fig, "fig2_markovization_learned.pdf")
     return rows
 
 
-def exp3_rates_dimension():
+def exp3_rates_real(seeds):
     rows = []
-    dims = [1, 2, 4, 8]
-    n_list = [1000, 2000, 5000, 10000, 20000, 50000]
-    for model in ["smooth", "rough", "jump"]:
-        for d in dims:
-            for n in n_list:
-                vals = []
-                for seed in range(10):
-                    # Real training is used for d=1; for higher dimensions we use the
-                    # same ReLU score-learning scaling law calibrated by pilot runs.
-                    if d == 1 and n <= 20000:
-                        net, rt, _ = train_score(40000 + seed + n + len(model), n, d=1,
-                                                 model=("smooth" if model != "jump" else "jump"),
-                                                 sigma=0.06, eps=0.1, width=64, depth=2)
-                        met = eval_continuous_1d(net, model=("smooth" if model != "jump" else "jump"),
-                                                 sigma=0.06, eps=0.1)
-                        vals.append(met["tv"] ** 2)
-                    else:
-                        beta = {"smooth": 2.0, "rough": 1.0, "jump": 0.55}[model]
-                        exponent = 2 * beta / (2 * beta + 2 * d)
-                        base = {"smooth": 0.22, "rough": 0.42, "jump": 0.58}[model]
-                        noise = np.random.RandomState(41000 + seed + n + 11 * d).lognormal(0, 0.08)
-                        vals.append(base * (n / 1000.0) ** (-exponent) * (1 + 0.18 * d) * noise)
-                rows.append((model, d, n, float(np.mean(vals)), float(np.std(vals) / math.sqrt(len(vals)))))
-    write_csv("exp3_rates_dimension.csv", ["model", "d", "n", "tv2_mean", "tv2_se"], rows)
-    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.2), sharey=True)
-    for ax, model in zip(axes, ["smooth", "rough", "jump"]):
-        for d in dims:
-            sub = [r for r in rows if r[0] == model and r[1] == d]
-            ax.errorbar([r[2] for r in sub], [r[3] for r in sub], yerr=[r[4] for r in sub],
-                        marker="o", label="d=%d" % d)
-        ax.set_xscale("log"); ax.set_yscale("log"); ax.set_title(model)
-        ax.set_xlabel("n")
-    axes[0].set_ylabel(r"$d_{\mu,\mathrm{TV}}^2$")
-    axes[-1].legend()
+    models = [("smooth", 0.07), ("rough", 0.07), ("multimodal", 0.06)]
+    n_list = [800, 1600, 3200, 6400, 10000]
+    for model, sigma in models:
+        for n in n_list:
+            vals = []
+            for seed in range(seeds):
+                net, _ = train_score(30000 + seed + n + len(model), n, model=model, sigma=sigma)
+                met = grid_quantities(net, model=model, sigma=sigma)
+                vals.append(met["tv"] ** 2)
+            rows.append((model, n, float(np.mean(vals)), float(np.std(vals) / math.sqrt(len(vals)))))
+    write_csv("exp3_rates_dimension.csv", ["model", "n", "tv2_mean", "tv2_se"], rows)
+    fig, ax = plt.subplots(figsize=(6.0, 3.6))
+    for model, _ in models:
+        sub = [r for r in rows if r[0] == model]
+        ax.errorbar([r[1] for r in sub], [r[2] for r in sub], yerr=[r[3] for r in sub],
+                    marker="o", label=model)
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("n"); ax.set_ylabel(r"$d_{\mu,\mathrm{TV}}^2$")
+    ax.set_title("Real-trained one-dimensional rate diagnostic")
+    ax.legend(frameon=False)
     savefig(fig, "fig3_rates_slopes.pdf")
-    return rows
+    slopes = []
+    for model, _ in models:
+        sub = [r for r in rows if r[0] == model]
+        slope, _ = np.polyfit(np.log([r[1] for r in sub]), np.log([r[2] for r in sub]), 1)
+        slopes.append((model, -float(slope)))
+    return rows, slopes
 
 
-def exp4_anchor_reference():
+def exp4_anchor_reference(seeds):
     rows = []
-    eps_list = [0.005, 0.01, 0.03, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8]
-    refs = ["uniform", "mismatched", "empirical", "mixture"]
-    # Empirical marginal pool.
+    eps_list = [0.01, 0.03, 0.05, 0.1, 0.2, 0.4, 0.7]
+    refs = ["uniform", "mismatched", "empirical-kde", "mixture"]
     pool_rng = np.random.RandomState(501)
-    Xpool = pool_rng.rand(5000, 1)
+    Xpool = pool_rng.rand(2500, 1)
     Ypool = sample_kernel(pool_rng, Xpool, model="smooth", sigma=0.07)
     for ref in refs:
         for eps in eps_list:
-            for seed in range(10):
-                net, rt, _ = train_score(50000 + seed + int(1000 * eps) + len(ref), 5000, d=1,
-                                         model="smooth", sigma=0.07, eps=eps, ref=ref,
-                                         width=48, depth=2, epochs=10, marginal_samples=Ypool)
-                met = eval_continuous_1d(net, model="smooth", sigma=0.07, eps=eps, ref=ref)
+            for seed in range(seeds):
+                net, _ = train_score(40000 + seed + int(1000 * eps) + len(ref), 3200,
+                                     model="smooth", sigma=0.07, eps=eps, ref=ref,
+                                     width=32, depth=2, epochs=7, marginal_samples=Ypool)
+                met = grid_quantities(net, model="smooth", sigma=0.07, eps=eps, ref=ref,
+                                      marginal_samples=Ypool)
                 rows.append((ref, eps, seed, (1 - eps) ** -1, met["excess"], met["a_l2"],
                              met["k_l2"], met["tv"], met["neg"], met["rowerr"]))
     write_csv("exp4_anchor_reference.csv",
@@ -416,18 +563,55 @@ def exp4_anchor_reference():
     fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.2))
     for ref in refs:
         for col, ax, ylabel in [(7, axes[0], "TV"), (4, axes[1], "excess"), (8, axes[2], "NegMass")]:
-            xs, ys, es = group_mean(rows, key_idx=1, val_idx=col, filt=lambda r: r[0] == ref)
+            sub = [r for r in rows if r[0] == ref]
+            xs = sorted(set(r[1] for r in sub))
+            ys = [np.mean([r[col] for r in sub if r[1] == x]) for x in xs]
+            es = [np.std([r[col] for r in sub if r[1] == x]) / math.sqrt(seeds) for x in xs]
             ax.errorbar(xs, ys, yerr=es, marker="o", label=ref)
             ax.set_xscale("log"); ax.set_xlabel(r"$\varepsilon$"); ax.set_ylabel(ylabel)
     axes[0].set_title("reconstruction")
     axes[1].set_title("contrastive fit")
     axes[2].set_title("de-anchor invalidity")
-    axes[2].legend()
+    axes[2].legend(frameon=False, fontsize=6.5)
     savefig(fig, "fig4_anchor_reference.pdf")
     return rows
 
 
-def exp5_trajectory_real():
+def sample_finite_transitions(rng, K, n, iid=True):
+    S = K.shape[0]
+    if iid:
+        X = rng.randint(0, S, size=n)
+        Y = np.array([rng.choice(S, p=K[x]) for x in X])
+        return X, Y
+    X = np.empty(n, dtype=int)
+    Y = np.empty(n, dtype=int)
+    state = rng.randint(0, S)
+    for i in range(n):
+        X[i] = state
+        state = rng.choice(S, p=K[state])
+        Y[i] = state
+    return X, Y
+
+
+def estimate_finite_kernel(X, Y, S, alpha=0.05):
+    counts = np.zeros((S, S))
+    for x, y in zip(X, Y):
+        counts[x, y] += 1
+    return (counts + alpha) / (counts.sum(axis=1, keepdims=True) + alpha * S)
+
+
+def finite_contrastive_excess(Khat, K0, eps=0.1, tau=5.0):
+    S = K0.shape[0]
+    r = 1.0 / S
+    a0 = (1 - eps) * K0 + eps * r
+    ah = (1 - eps) * Khat + eps * r
+    q = tau * r
+    Fh = -a0 * np.log(ah / (ah + q)) - q * np.log(q / (ah + q))
+    F0 = -a0 * np.log(a0 / (a0 + q)) - q * np.log(q / (a0 + q))
+    return float(np.mean(np.sum(Fh - F0, axis=1)))
+
+
+def exp5_trajectory_real(seeds):
     rows = []
     q_rows = []
     S = 40
@@ -438,32 +622,28 @@ def exp5_trajectory_real():
         K0 = (1 - alpha) * np.eye(S) + alpha * U
         for T in T_list:
             for method in ["iid", "full", "thin"]:
-                vals = []
-                risks = []
-                for seed in range(10):
-                    rng = np.random.RandomState(60000 + seed + T + int(1000 * alpha))
-                    iid = (method == "iid")
-                    X, Y = sample_finite_transitions(rng, K0, T, iid=iid)
+                vals, risks = [], []
+                for seed in range(seeds):
+                    rng = np.random.RandomState(50000 + seed + T + int(1000 * alpha))
+                    X, Y = sample_finite_transitions(rng, K0, T, iid=(method == "iid"))
                     if method == "thin":
-                        q = max(1, int(round(1.0 / alpha)))
+                        q = max(2, int(round(1.0 / alpha)))
                         idx = np.arange(0, T, q)
                         X, Y = X[idx], Y[idx]
                     Kh = estimate_finite_kernel(X, Y, S, alpha=0.05)
                     vals.append(finite_tv(K0, Kh))
                     risks.append(finite_contrastive_excess(Kh, K0))
-                rows.append((alpha, T, method, float(np.mean(vals)), float(np.std(vals) / math.sqrt(10)),
+                rows.append((alpha, T, method, float(np.mean(vals)), float(np.std(vals) / math.sqrt(seeds)),
                              float(np.mean(risks))))
-        T = 10000
-        q_list = [1, 2, 5, 10, 20, 50, 100]
-        for q in q_list:
+        for q in [1, 2, 5, 10, 20, 50, 100]:
             vals = []
-            for seed in range(10):
-                rng = np.random.RandomState(70000 + seed + int(1000 * alpha))
-                X, Y = sample_finite_transitions(rng, K0, T, iid=False)
-                idx = np.arange(0, T, q)
+            for seed in range(seeds):
+                rng = np.random.RandomState(55000 + seed + int(1000 * alpha))
+                X, Y = sample_finite_transitions(rng, K0, 10000, iid=False)
+                idx = np.arange(0, 10000, q)
                 Kh = estimate_finite_kernel(X[idx], Y[idx], S, alpha=0.05)
                 vals.append(finite_tv(K0, Kh))
-            q_rows.append((alpha, q, float(np.mean(vals)), float(np.std(vals) / math.sqrt(10)),
+            q_rows.append((alpha, q, float(np.mean(vals)), float(np.std(vals) / math.sqrt(seeds)),
                            math.exp(-alpha * q)))
     write_csv("exp5_trajectory_real.csv", ["alpha", "T", "method", "tv", "se", "heldout_excess"], rows)
     write_csv("exp5_thinning_real.csv", ["alpha", "q", "tv", "se", "beta_proxy"], q_rows)
@@ -483,90 +663,75 @@ def exp5_trajectory_real():
         sub = [r for r in rows if r[0] == alpha and r[2] == method]
         axes[2].errorbar([r[1] for r in sub], [r[3] for r in sub], yerr=[r[4] for r in sub], marker="o", label=method)
     axes[2].set_xscale("log"); axes[2].set_yscale("log"); axes[2].set_title(r"iid/full/thin, $\alpha=.05$")
-    axes[2].set_xlabel("sample size"); axes[2].legend()
+    axes[2].set_xlabel("sample size"); axes[2].legend(frameon=False)
     savefig(fig, "fig5_trajectory_real.pdf")
     return rows, q_rows
 
 
-def finite_contrastive_excess(Khat, K0, eps=0.1, tau=5.0):
-    S = K0.shape[0]
-    r = 1.0 / S
-    a0 = (1 - eps) * K0 + eps * r
-    ah = (1 - eps) * Khat + eps * r
-    q = tau * r
-    Fh = -a0 * np.log(ah / (ah + q)) - q * np.log(q / (ah + q))
-    F0 = -a0 * np.log(a0 / (a0 + q)) - q * np.log(q / (a0 + q))
-    return float(np.mean(np.sum(Fh - F0, axis=1)))
-
-
-def exp6_dynamic_learned():
-    rng = np.random.RandomState(610)
-    S = 30
-    U = np.ones((S, S)) / S
-    K0 = 0.8 * np.eye(S) + 0.2 * U
-    mu = np.ones(S) / S
-    horizons = [1, 2, 5, 10, 20, 50]
+def exp6_dynamic_learned(seeds):
     rows = []
-    for n in [1000, 2000, 5000, 10000, 20000]:
-        for eps in [0.05, 0.1, 0.2, 0.4]:
-            for seed in range(10):
-                rr = np.random.RandomState(80000 + seed + n + int(1000 * eps))
-                X, Y = sample_finite_transitions(rr, K0, n, iid=True)
-                Kh = estimate_finite_kernel(X, Y, S, alpha=0.05)
-                Kmark = row_markovize(Kh + rr.normal(0, 0.002, Kh.shape))
-                ktv = finite_tv(K0, Kmark, mu)
-                roll = rollout_tv(K0, Kmark, mu, horizons)
-                rows.append((n, eps, seed, ktv) + tuple(roll))
+    horizons = [1, 2, 5, 10, 20, 50]
+    xi = np.ones(54) / 54
+    for n in [1000, 3200, 6400]:
+        for eps in [0.05, 0.1, 0.2]:
+            for seed in range(seeds):
+                net, _ = train_score(60000 + seed + n + int(1000 * eps), n, model="smooth", sigma=0.07, eps=eps)
+                met = grid_quantities(net, model="smooth", sigma=0.07, eps=eps, nx=54, ny=54)
+                ktv = finite_tv(met["Ptrue"], met["Pmark"], xi)
+                roll = rollout_tv(met["Ptrue"], met["Pmark"], xi, horizons)
+                p10 = path_tv(met["Ptrue"], met["Pmark"], xi, 10)
+                o10 = occupation_tv(met["Ptrue"], met["Pmark"], xi, 10)
+                rows.append((n, eps, seed, ktv, p10, o10) + tuple(roll))
     rare_rows = []
     for delta in [0.01, 0.02, 0.05]:
         Krare = np.array([[1., 0.], [1., 0.]])
         Lrare = np.array([[1., 0.], [0., 1.]])
         murare = np.array([1 - delta, delta])
         xirare = np.array([0., 1.])
-        rare_rows.append((delta, finite_tv(Krare, Lrare, murare), rollout_tv(Krare, Lrare, xirare, horizons)[0]))
+        rare_rows.append((delta, finite_tv(Krare, Lrare, murare), rollout_tv(Krare, Lrare, xirare, [1])[0]))
     stat_rows = []
-    for alpha in [0.03, 0.05, 0.1, 0.2, 0.5]:
+    S = 30
+    U = np.ones((S, S)) / S
+    for alpha in [0.05, 0.1, 0.2, 0.5]:
         K = (1 - alpha) * np.eye(S) + alpha * U
-        for seed in range(10):
-            L = row_markovize(K + np.random.RandomState(90000 + seed).normal(0, 0.003, K.shape))
-            piK, piL = stationary_dist(K), stationary_dist(L)
-            stat = 0.5 * np.abs(piK - piL).sum()
+        for seed in range(seeds):
+            rng = np.random.RandomState(65000 + seed + int(1000 * alpha))
+            L = row_markovize_prob(K + rng.normal(0, 0.002, K.shape))
+            piK = np.ones(S) / S
+            piL = np.linalg.matrix_power(L.T, 200).dot(np.ones(S) / S)
+            piL = piL / piL.sum()
             dinf = np.max(0.5 * np.sum(np.abs(K - L), axis=1))
-            stat_rows.append((alpha, 1.0 / alpha, dinf / alpha, stat))
-    write_csv("exp6_dynamic_learned.csv", ["n", "epsilon", "seed", "kernel_tv"] + ["roll_%d" % h for h in horizons], rows)
+            stat_rows.append((alpha, 1.0 / alpha, dinf / alpha, float(0.5 * np.abs(piK - piL).sum())))
+    write_csv("exp6_dynamic_learned.csv", ["n", "epsilon", "seed", "kernel_tv", "path10_tv", "occ10_tv"] + ["roll_%d" % h for h in horizons], rows)
     write_csv("exp6_rare.csv", ["delta", "design_tv", "one_step_rollout_tv"], rare_rows)
     write_csv("exp6_stationary.csv", ["alpha", "amplification", "bound_proxy", "stationary_tv"], stat_rows)
     fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.25))
     ktv = np.array([r[3] for r in rows])
-    horizon_colors = {1: "#4C78A8", 5: "#72B7B2", 10: "#F58518", 20: "#E45756", 50: "#B279A2"}
     for h in [1, 5, 10, 20, 50]:
-        yh = np.array([r[3 + horizons.index(h) + 1] for r in rows])
-        axes[0].scatter(ktv, yh, s=10, alpha=0.32, color=horizon_colors[h], label="m=%d" % h)
-    lim = max(ktv.max(), max([max([r[3 + horizons.index(h) + 1] for r in rows]) for h in [1, 5, 10, 20, 50]])) * 1.05
+        yh = np.array([r[6 + horizons.index(h)] for r in rows])
+        axes[0].scatter(ktv, yh, s=13, alpha=0.42, label="m=%d" % h)
+    lim = max(ktv.max(), max([max([r[6 + horizons.index(h)] for r in rows]) for h in [1, 5, 10, 20, 50]])) * 1.05
     axes[0].plot([0, lim], [0, lim], "k--", linewidth=1.0)
     axes[0].set_xlim(0, lim); axes[0].set_ylim(0, lim)
     axes[0].set_xlabel(r"$d_{\mu,\mathrm{TV}}(\widehat K,K_0)$")
     axes[0].set_ylabel("rollout TV")
     axes[0].set_title("learned-kernel transfer")
-    axes[0].legend(frameon=False, fontsize=6.3, ncol=1)
-
+    axes[0].legend(frameon=False, fontsize=6.0)
     q1, q2 = np.quantile(ktv, [1 / 3, 2 / 3])
-    groups = [("low", ktv <= q1, "#4C78A8"), ("middle", (ktv > q1) & (ktv <= q2), "#72B7B2"),
-              ("high", ktv > q2, "#E45756")]
-    for label, mask, color in groups:
-        means = []
-        ses = []
+    for label, mask, color in [
+        ("low", ktv <= q1, "#4C78A8"),
+        ("middle", (ktv > q1) & (ktv <= q2), "#72B7B2"),
+        ("high", ktv > q2, "#E45756"),
+    ]:
+        means, ses = [], []
         for h in horizons:
-            vals = np.array([r[3 + horizons.index(h) + 1] for r in rows])[mask]
+            vals = np.array([r[6 + horizons.index(h)] for r in rows])[mask]
             means.append(vals.mean())
             ses.append(vals.std() / math.sqrt(len(vals)))
         axes[1].errorbar(horizons, means, yerr=ses, marker="o", color=color, label=label)
-    axes[1].set_xscale("log")
-    axes[1].set_xlabel("horizon m")
-    axes[1].set_ylabel("rollout TV")
-    axes[1].set_title("horizon growth by kernel-error tertile")
+    axes[1].set_xscale("log"); axes[1].set_xlabel("horizon m")
+    axes[1].set_ylabel("rollout TV"); axes[1].set_title("horizon growth")
     axes[1].legend(frameon=False, title="kernel TV")
-
     deltas = np.array([r[0] for r in rare_rows])
     amplification = np.array([r[2] / r[1] for r in rare_rows])
     axes[2].bar([str(d) for d in deltas], amplification, color="#B279A2", width=0.55)
@@ -580,153 +745,148 @@ def exp6_dynamic_learned():
     return rows, rare_rows, stat_rows
 
 
-def exp7_ablation():
+def exp7_ablation(seeds):
     variants = [
-        ("Ours", 0.1, "uniform", True, True, 5, True),
-        ("no-anchor", 0.0, "uniform", True, True, 5, True),
-        ("no-deanchor", 0.1, "uniform", False, True, 5, True),
-        ("no-Markov", 0.1, "uniform", True, False, 5, True),
-        ("wrong-reference", 0.1, "mismatched", True, True, 5, True),
-        ("small-eps", 0.01, "uniform", True, True, 5, True),
-        ("large-eps", 0.8, "uniform", True, True, 5, True),
-        ("no-validation", 0.1, "uniform", True, True, 5, False),
-        ("few-negatives", 0.1, "uniform", True, True, 1, True),
-        ("many-negatives", 0.1, "uniform", True, True, 20, True),
+        ("Ours", 0.1, "uniform", True, True, 5, 32, True),
+        ("no-anchor", 0.0, "uniform", True, True, 5, 32, True),
+        ("no-deanchor", 0.1, "uniform", False, True, 5, 32, True),
+        ("no-Markov", 0.1, "uniform", True, False, 5, 32, False),
+        ("wrong-reference", 0.1, "mismatched", True, True, 5, 32, True),
+        ("small-eps", 0.01, "uniform", True, True, 5, 32, True),
+        ("large-eps", 0.7, "uniform", True, True, 5, 32, True),
+        ("no-validation", 0.1, "uniform", True, True, 5, 16, True),
+        ("few-negatives", 0.1, "uniform", True, True, 1, 32, True),
+        ("many-negatives", 0.1, "uniform", True, True, 15, 32, True),
     ]
     rows = []
-    for name, eps, ref, deanchor, markov, tau, validation in variants:
+    xi = np.ones(54) / 54
+    for name, eps, ref, deanchor, markov, tau, width, rollout_ok in variants:
         vals = []
-        for seed in range(10):
-            width = 48 if validation else 24
-            ep_eff = max(eps, 1e-4)
-            net, rt, _ = train_score(100000 + seed + len(name), 5000, model="smooth", sigma=0.07,
-                                     eps=ep_eff, tau=tau, ref=ref, width=width, depth=2, epochs=10)
-            met = eval_continuous_1d(net, model="smooth", sigma=0.07, eps=ep_eff, tau=tau, ref=ref)
+        for seed in range(seeds):
+            ep_eff = max(eps, 1e-5)
+            net, _ = train_score(70000 + seed + len(name), 3200, model="multimodal", sigma=0.06,
+                                 eps=ep_eff, tau=tau, ref=ref, width=width, depth=2, epochs=7)
+            met = grid_quantities(net, model="multimodal", sigma=0.06, eps=ep_eff, tau=tau, ref=ref,
+                                  markovize=markov, deanchor=deanchor, nx=54, ny=54)
+            if rollout_ok:
+                roll = rollout_tv(met["Ptrue"], met["Pmark"], xi, [10])[0]
+            else:
+                roll = np.nan
             tv = met["tv"] if markov else met["tv_pre"]
-            if not deanchor:
-                tv = max(tv, 0.18)
-            rollout = min(1.0, 1.8 * tv)
-            vals.append((met["excess"], tv, met["neg"], met["rowerr"], rollout))
-        vals = np.array(vals)
-        rows.append((name,) + tuple(vals.mean(axis=0)) + tuple(vals.std(axis=0) / math.sqrt(vals.shape[0])))
+            vals.append((met["excess"], tv, met["neg"], met["rowerr"], roll))
+        vals = np.array(vals, dtype=float)
+        means = []
+        ses = []
+        for j in range(vals.shape[1]):
+            col = vals[:, j]
+            finite = col[np.isfinite(col)]
+            if finite.size == 0:
+                means.append(np.nan)
+                ses.append(np.nan)
+            else:
+                means.append(float(finite.mean()))
+                ses.append(float(finite.std() / math.sqrt(finite.size)))
+        rows.append((name,) + tuple(means) + tuple(ses))
     write_csv("exp7_ablation.csv",
               ["variant", "excess", "tv", "negmass", "rowerr", "rollout_tv",
                "excess_se", "tv_se", "negmass_se", "rowerr_se", "rollout_se"], rows)
-    M = np.array([[r[1], r[2], r[3], r[4], r[5]] for r in rows], dtype=float)
-    Mn = M / np.maximum(M[0:1], 1e-8)
+    M = np.array([[r[1], r[2], max(r[3], 1e-8), max(r[4], 1e-8), r[5] if np.isfinite(r[5]) else np.nan] for r in rows])
+    baseline = np.maximum(M[0:1], 1e-8)
+    Mn = M / baseline
     fig, ax = plt.subplots(figsize=(7.5, 4.3))
-    im = ax.imshow(np.log10(np.maximum(Mn, 1e-3)), aspect="auto", cmap="magma")
+    masked = np.ma.masked_invalid(np.log10(np.maximum(Mn, 1e-3)))
+    im = ax.imshow(masked, aspect="auto", cmap="magma")
     ax.set_yticks(range(len(rows))); ax.set_yticklabels([r[0] for r in rows])
     ax.set_xticks(range(5)); ax.set_xticklabels(["Excess", "TV", "NegMass", "RowErr", "Rollout"])
     fig.colorbar(im, ax=ax, label="log10 relative to Ours")
-    ax.set_title("Ablation study")
+    ax.set_title("Real-trained ablation study")
     savefig(fig, "fig7_ablation_heatmap.pdf")
     return rows
 
 
 def exp8_runtime():
     rows = []
-    for n in [1000, 5000, 10000, 50000]:
-        for tau in [5, 10, 20, 50]:
-            # measured training time on a capped batch plus linear extrapolation for large n*tau
-            t0 = time.time()
-            net, rt, _ = train_score(120000 + n + tau, min(n, 5000), model="smooth", sigma=0.07,
-                                     eps=0.1, tau=min(tau, 20), width=32, depth=2, epochs=4)
-            train_time = rt * (n * (1 + tau)) / (min(n, 5000) * (1 + min(tau, 20)))
-            rows.append(("continuous", n, tau, train_time, 0.000002 * n * tau, 0.000001 * n))
-    for S in [50, 100, 200, 500, 1000]:
+    for n in [800, 1600, 3200, 6400]:
+        for tau in [3, 5, 10]:
+            seed = 80000 + n + tau
+            rng = np.random.RandomState(seed)
+            t0 = time.perf_counter()
+            Z, labels = build_contrastive_data(rng, n, model="smooth", sigma=0.07, eps=0.1, tau=tau)
+            data_time = time.perf_counter() - t0
+            net = ReLUContrastiveNet(2, width=24, depth=2, seed=seed + 17)
+            t1 = time.perf_counter()
+            net.fit(Z, labels, epochs=5, batch_size=512, lr=2e-3)
+            train_time = time.perf_counter() - t1
+            t2 = time.perf_counter()
+            met = grid_quantities(net, model="smooth", sigma=0.07, eps=0.1, tau=tau, nx=42, ny=42)
+            eval_total = time.perf_counter() - t2
+            t3 = time.perf_counter()
+            _ = row_markovize_prob(met["Phat"])
+            mark_time = time.perf_counter() - t3
+            rows.append(("continuous", n, tau, data_time, train_time, mark_time, max(eval_total - mark_time, 0.0)))
+    for S in [50, 100, 200, 500]:
         K = np.ones((S, S)) / S
-        t0 = time.time()
-        _ = row_markovize(K + 0.001 * np.random.randn(S, S))
-        mt = time.time() - t0
-        rows.append(("finite", S, 0, 0.0000008 * S * S, mt, 0.0000004 * S * S))
-    write_csv("exp8_runtime.csv", ["setting", "size", "negatives", "training_time", "markovization_time", "evaluation_time"], rows)
+        t0 = time.perf_counter()
+        _ = row_markovize_prob(K + 0.001 * np.random.randn(S, S))
+        mt = time.perf_counter() - t0
+        rows.append(("finite", S, 0, 0.0, 0.0, mt, 0.0))
+    write_csv("exp8_runtime.csv", ["setting", "size", "negatives", "data_time", "training_time", "markovization_time", "evaluation_time"], rows)
     fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.25))
-    colors = {5: "#4C78A8", 10: "#72B7B2", 20: "#F58518", 50: "#E45756"}
     continuous = [r for r in rows if r[0] == "continuous"]
-    xs = np.array([r[1] * (1 + r[2]) for r in continuous], dtype=float)
-    ys = np.array([r[3] for r in continuous], dtype=float)
-    for tau in [5, 10, 20, 50]:
+    for tau in [3, 5, 10]:
         sub = [r for r in continuous if r[2] == tau]
-        axes[0].scatter([r[1] * (1 + r[2]) for r in sub], [r[3] for r in sub],
-                        s=28, color=colors[tau], label="M=%d" % tau, alpha=0.85)
-    slope, intercept = np.polyfit(np.log(xs), np.log(ys), 1)
-    xline = np.array([xs.min(), xs.max()])
-    yline = np.exp(intercept) * xline ** slope
-    axes[0].plot(xline, yline, "k--", linewidth=1.0, label="log-log fit")
+        axes[0].scatter([r[1] * (1 + r[2]) for r in sub], [r[4] for r in sub], s=28, label="M=%d" % tau)
     axes[0].set_xscale("log"); axes[0].set_yscale("log")
-    axes[0].set_title("training cost")
+    axes[0].set_title("measured training cost")
     axes[0].set_xlabel(r"contrastive examples $n(1+M)$")
     axes[0].set_ylabel("seconds")
     axes[0].legend(frameon=False)
-
-    reps = [("1k, M=5", 1000, 5), ("10k, M=20", 10000, 20), ("50k, M=50", 50000, 50)]
+    reps = [("800,M=3", 800, 3), ("3200,M=5", 3200, 5), ("6400,M=10", 6400, 10)]
     x = np.arange(len(reps))
-    train_vals, mark_vals, eval_vals = [], [], []
+    data_vals, train_vals, mark_vals, eval_vals = [], [], [], []
     for _, n, tau in reps:
         match = [r for r in rows if r[0] == "continuous" and r[1] == n and r[2] == tau][0]
-        train_vals.append(match[3]); mark_vals.append(match[4]); eval_vals.append(match[5])
-    axes[1].bar(x, train_vals, label="training", color="#4C78A8")
-    axes[1].bar(x, eval_vals, bottom=train_vals, label="evaluation", color="#72B7B2")
-    axes[1].bar(x, mark_vals, bottom=np.array(train_vals) + np.array(eval_vals), label="Markovization", color="#F58518")
+        data_vals.append(match[3]); train_vals.append(match[4]); mark_vals.append(match[5]); eval_vals.append(match[6])
+    axes[1].bar(x, data_vals, label="data", color="#B279A2")
+    axes[1].bar(x, train_vals, bottom=data_vals, label="training", color="#4C78A8")
+    axes[1].bar(x, eval_vals, bottom=np.array(data_vals) + np.array(train_vals), label="evaluation", color="#72B7B2")
+    axes[1].bar(x, mark_vals, bottom=np.array(data_vals) + np.array(train_vals) + np.array(eval_vals), label="Markovization", color="#F58518")
     axes[1].set_yscale("log")
     axes[1].set_xticks(x); axes[1].set_xticklabels([r[0] for r in reps], rotation=15)
     axes[1].set_ylabel("seconds")
-    axes[1].set_title("time decomposition")
-    axes[1].legend(frameon=False, fontsize=6.7)
-
-    total = np.array([r[3] + r[4] + r[5] for r in continuous])
-    post_frac = np.array([(r[4] + r[5]) / (r[3] + r[4] + r[5]) for r in continuous])
-    examples = np.array([r[1] * (1 + r[2]) for r in continuous])
-    axes[2].scatter(examples, post_frac, s=24, alpha=0.75, color="#B279A2")
-    axes[2].set_xscale("log")
-    axes[2].set_ylim(0, max(0.32, post_frac.max() * 1.15))
-    axes[2].set_xlabel(r"contrastive examples $n(1+M)$")
-    axes[2].set_ylabel("post-processing share")
-    axes[2].set_title("post-processing is not dominant")
+    axes[1].set_title("measured time decomposition")
+    axes[1].legend(frameon=False, fontsize=6.5)
+    finite = [r for r in rows if r[0] == "finite"]
+    axes[2].plot([r[1] for r in finite], [r[5] for r in finite], marker="o", color="#F58518")
+    axes[2].set_xscale("log"); axes[2].set_yscale("log")
+    axes[2].set_xlabel("states S"); axes[2].set_ylabel("seconds")
+    axes[2].set_title("measured finite-state Markovization")
     savefig(fig, "fig8_runtime_scalability.pdf")
     return rows
 
 
-def group_mean(rows, key_idx, val_idx, filt=lambda r: True):
-    groups = {}
-    for r in rows:
-        if filt(r):
-            groups.setdefault(r[key_idx], []).append(float(r[val_idx]))
-    xs = sorted(groups)
-    ys = [np.mean(groups[x]) for x in xs]
-    es = [np.std(groups[x]) / math.sqrt(len(groups[x])) for x in xs]
-    return xs, ys, es
+def fmt(x):
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        return "N/A"
+    return "%.3g" % float(x)
 
 
-def write_csv(name, header, rows):
-    with open(os.path.join(V2, name), "w") as f:
-        f.write(",".join(header) + "\n")
-        for row in rows:
-            f.write(",".join(str(x) for x in row) + "\n")
-
-
-def savefig(fig, name):
-    fig.tight_layout()
-    fig.savefig(os.path.join(V2, name))
-    plt.close(fig)
-
-
-def write_tables(exp1, exp3, exp7):
+def write_tables(exp1, exp3, exp7, exp8, seeds):
     theory = r"""\begin{table}[t]
 \centering
-\begin{tabular}{lll}
+\footnotesize
+\begin{tabular}{p{0.20\textwidth}p{0.38\textwidth}p{0.32\textwidth}}
 \toprule
 Experiment & Theory tested & Main metric\\
 \midrule
 Calibration & excess-risk calibration & $L^2$ error\\
 Markovization & valid kernel reconstruction & NegMass, RowErr, $R_M$\\
-Rates & H\"older--ReLU oracle & TV rate and fitted slope\\
+Rates & H\"older--ReLU oracle diagnostic & trained 1D TV rate\\
 Anchor & anchor/de-anchor tradeoff & TV, excess, invalidity\\
-Trajectory & beta-mixing oracle & held-out TV and risk\\
-Dynamics & finite-horizon transfer & rollout TV\\
-Ablation & component necessity & relative degradation\\
-Runtime & scalability & training and Markovization time\\
+Trajectory & thinning interface stress test & held-out TV and risk\\
+Dynamics & finite-horizon transfer and coverage & rollout, path, occupation TV\\
+Ablation & component necessity and final validity & validity, TV, rollout\\
+Runtime & measured implementation cost & wall-clock components\\
 \bottomrule
 \end{tabular}
 \caption{Theory-to-experiment map for the end-to-end simulation suite.}
@@ -735,68 +895,107 @@ Runtime & scalability & training and Markovization time\\
 """
     dataset = r"""\begin{table}[t]
 \centering
-\begin{tabular}{lll}
+\footnotesize
+\begin{tabular}{p{0.20\textwidth}p{0.40\textwidth}p{0.30\textwidth}}
 \toprule
 Module & Synthetic models & Main parameters\\
 \midrule
-Calibration & smooth, multimodal, near-deterministic kernels & $n=500$--$20000$, 10 seeds\\
-Markovization & sparse chains and nearly deterministic grids & $S=50,100,200$\\
-Rates & smooth, rough, smoothed-jump maps & $d=1,2,4,8$, $n=1000$--$50000$\\
-Anchor & four reference laws & $\varepsilon=0.005$--$0.8$\\
-Trajectory & lazy finite chains & $\alpha=0.02$--$0.5$, $q=1$--$100$\\
-Dynamics & learned finite kernels and rare-state failures & horizons $1$--$50$\\
+Calibration & smooth, multimodal, rough wrapped-normal kernels & $n=800$--$6400$, %d seeds\\
+Markovization & trained contrastive scores & $n=1000$--$6400$\\
+Rates & real-trained one-dimensional smoothness models & $n=800$--$10000$\\
+Anchor & four matched sampler/density reference laws & $\varepsilon=0.01$--$0.7$\\
+Trajectory & single-chain and i.i.d. finite transitions & $\alpha=0.02$--$0.5$, $q=1$--$100$\\
+Dynamics & learned contrastive kernels and rare-state failures & horizons $1$--$50$\\
 \bottomrule
 \end{tabular}
-\caption{Datasets, synthetic models, and parameter grids.}
+\caption{Datasets, synthetic models, and parameter grids.  All training-based figures are generated end-to-end by the public script; deterministic diagnostic examples are labeled separately.}
 \label{tab:experimental-models}
 \end{table}
-"""
+""" % seeds
     with open(os.path.join(V2, "table1_theory_map.tex"), "w") as f:
         f.write(theory)
     with open(os.path.join(V2, "table2_models.tex"), "w") as f:
         f.write(dataset)
-    # Method comparison from ablation rows.
+    with open(os.path.join(V2, "table5_rate_slopes.tex"), "w") as f:
+        f.write("\\begin{table}[t]\n\\centering\n\\footnotesize\n\\begin{tabular}{lc}\n\\toprule\nModel & fitted slope for $d_{\\mu,\\mathrm{TV}}^2$\\\\\n\\midrule\n")
+        for model, slope in exp3[1]:
+            f.write("%s & %.2f\\\\\n" % (model, slope))
+        f.write("\\bottomrule\n\\end{tabular}\n\\caption{OLS slopes from the real-trained one-dimensional rate diagnostic.  The table is descriptive and is not a high-dimensional benchmark.}\n\\label{tab:rate-slopes}\n\\end{table}\n")
     lookup = {r[0]: r for r in exp7}
+    gb_tv, gb_roll = gaussian_cde_baseline(seed=123, model="multimodal", sigma=0.06)
     rows = [
-        ("Ours", lookup["Ours"]),
-        ("Ours-noMarkov", lookup["no-Markov"]),
-        ("Unanchored-NCE", lookup["no-anchor"]),
-        ("Neural-MLE", lookup["no-deanchor"]),
-        ("KDE/histogram", ("KDE/histogram", 0.035, 0.127, 0.0, 0.0, 0.10)),
-        ("Oracle parametric", ("Oracle parametric", 0.0, 0.06, 0.0, 0.0, 0.04)),
+        ("Ours", "full interface", "Yes", lookup["Ours"][2], lookup["Ours"][5]),
+        ("Ours-noMarkov", "score without repair", "No", lookup["no-Markov"][2], None),
+        ("Anchored-noDeanchor", "wrong target kernel", r"Yes, $A_{\eps,\nu}K_0$", lookup["no-deanchor"][2], lookup["no-deanchor"][5]),
+        ("Unanchored-NCE", "accurate but no restart chart", "no guarantee", lookup["no-anchor"][2], lookup["no-anchor"][5]),
+        ("Gaussian-CDE", "row-normalized baseline", "Yes", gb_tv, gb_roll),
     ]
-    lines = [r"\begin{table}[t]", r"\centering", r"\begin{tabular}{lccccc}", r"\toprule",
-             r"Method & Excess & $d_{\mu,\mathrm{TV}}$ & NegMass & RowErr & rollout TV\\", r"\midrule"]
-    for name, r in rows:
-        lines.append("%s & %.3g & %.3g & %.3g & %.3g & %.3g\\\\" % (name, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
+    lines = [r"\begin{table}[t]", r"\centering", r"\footnotesize", r"\begin{tabular}{llccc}", r"\toprule",
+             r"Method & Role & Final valid? & $d_{\mu,\mathrm{TV}}$ & rollout TV\\", r"\midrule"]
+    for name, role, valid, tv, rollout in rows:
+        lines.append("%s & %s & %s & %s & %s\\\\" % (name, role, valid, fmt(tv), fmt(rollout)))
     lines += [r"\bottomrule", r"\end{tabular}",
-              r"\caption{Representative method comparison.  Values are averages over the simulation seeds for the main continuous setting unless the method is an analytic oracle or histogram baseline.}",
+              r"\caption{Interface-oriented method comparison after end-to-end training.  Gaussian-CDE is a row-normalized circular Gaussian regression baseline trained on the same synthetic transition law.  No-Markov is not rolled out because it is not a valid transition kernel.}",
               r"\label{tab:method-comparison}", r"\end{table}"]
     with open(os.path.join(V2, "table3_method_comparison.tex"), "w") as f:
         f.write("\n".join(lines))
-    lines = [r"\begin{table}[t]", r"\centering", r"\begin{tabular}{lccccc}", r"\toprule",
-             r"Variant & Excess & TV & NegMass & RowErr & RolloutTV\\", r"\midrule"]
+    valid = {
+        "Ours": "Yes", "no-anchor": "no guarantee", "no-deanchor": "Yes, wrong kernel",
+        "no-Markov": "No", "wrong-reference": "Yes", "small-eps": "Yes",
+        "large-eps": "Yes", "no-validation": "Yes", "few-negatives": "Yes",
+        "many-negatives": "Yes",
+    }
+    lines = [r"\begin{table}[t]", r"\centering", r"\footnotesize", r"\begin{tabular}{lcccccc}", r"\toprule",
+             r"Variant & Excess & TV & Pre-M NegMass & Pre-M RowErr & Final valid? & RolloutTV\\", r"\midrule"]
     for r in exp7:
-        lines.append("%s & %.3g & %.3g & %.3g & %.3g & %.3g\\\\" % (r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
+        neg = "N/A" if r[0] in ("no-anchor", "no-deanchor") else fmt(r[3])
+        row = "N/A" if r[0] == "no-deanchor" else fmt(r[4])
+        lines.append("%s & %s & %s & %s & %s & %s & %s\\\\" %
+                     (r[0], fmt(r[1]), fmt(r[2]), neg, row, valid.get(r[0], "Yes"), fmt(r[5])))
     lines += [r"\bottomrule", r"\end{tabular}",
-              r"\caption{Ablation summary.  Removing anchoring, de-anchoring, Markovization, validation, or reference coverage worsens at least one metric.}",
+              r"\caption{Ablation summary from real-trained variants.  Pre-M NegMass and Pre-M RowErr refer only to the de-anchored score before Markovization.  N/A means that the corresponding pre-Markovization diagnostic or rollout is not defined for that ablation.  The no-Markov row is not rolled out because it is not a valid transition kernel.}",
               r"\label{tab:ablation-summary}", r"\end{table}"]
     with open(os.path.join(V2, "table4_ablation.tex"), "w") as f:
         f.write("\n".join(lines))
+    coverage = r"""\begin{table}[t]
+\centering
+\footnotesize
+\begin{tabular}{cccc}
+\toprule
+Rare-state mass $\delta$ & $d_{\mu,\mathrm{TV}}(K,L)$ & rare-state rollout TV & amplification\\
+\midrule
+0.01 & 0.01 & 1.00 & $100\times$\\
+0.02 & 0.02 & 1.00 & $50\times$\\
+0.05 & 0.05 & 1.00 & $20\times$\\
+\bottomrule
+\end{tabular}
+\caption{Coverage-failure diagnostic.  A design-averaged one-step error can be made small by assigning small design mass to a rare state, while rollout from that state remains maximally wrong.  This table visualizes the obstruction in Proposition~\ref{prop:limitation}.}
+\label{tab:coverage-failure}
+\end{table}
+"""
+    with open(os.path.join(V2, "table7_coverage_failure.tex"), "w") as f:
+        f.write(coverage)
 
 
 def main():
+    global V2
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--out", type=str, default=V2)
+    args = parser.parse_args()
+    V2 = os.path.abspath(args.out)
+    ensure_dir(V2)
     style()
-    exp1 = exp1_end_to_end()
-    exp2 = exp2_markovization_learned()
-    exp3 = exp3_rates_dimension()
-    exp4 = exp4_anchor_reference()
-    exp5 = exp5_trajectory_real()
-    exp6 = exp6_dynamic_learned()
-    exp7 = exp7_ablation()
+    exp1 = exp1_end_to_end(args.seeds)
+    exp2_markovization_learned(args.seeds)
+    exp3 = exp3_rates_real(args.seeds)
+    exp4_anchor_reference(args.seeds)
+    exp5_trajectory_real(args.seeds)
+    exp6_dynamic_learned(args.seeds)
+    exp7 = exp7_ablation(args.seeds)
     exp8 = exp8_runtime()
-    write_tables(exp1, exp3, exp7)
-    print("Wrote upgraded results to", V2)
+    write_tables(exp1, exp3, exp7, exp8, args.seeds)
+    print("wrote results to %s" % V2)
 
 
 if __name__ == "__main__":
