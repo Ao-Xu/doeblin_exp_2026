@@ -1,4 +1,5 @@
 import argparse
+import copy
 import math
 import os
 import shutil
@@ -45,6 +46,11 @@ def write_csv(name, header, rows):
 def savefig(fig, name):
     fig.tight_layout()
     fig.savefig(os.path.join(V2, name))
+    plt.close(fig)
+
+
+def savefig_no_tight(fig, name):
+    fig.savefig(os.path.join(V2, name), bbox_inches="tight")
     plt.close(fig)
 
 
@@ -632,6 +638,43 @@ def exp3_rates_real(seeds):
     return rows, slopes
 
 
+def plot_statistical_diagnostics(exp1_rows, exp3_result):
+    """Combine calibration and rate diagnostics into the paper's compact Figure 1."""
+    exp3_rows, slopes = exp3_result
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2))
+
+    arr = np.array([[max(r[4], 1e-8), r[6], r[7]] for r in exp1_rows], dtype=float)
+    axes[0].scatter(arr[:, 0], arr[:, 1], s=14, alpha=0.55,
+                    label=r"$\|\hat a-a_0\|_2^2$")
+    axes[0].scatter(arr[:, 0], arr[:, 2], s=14, alpha=0.55,
+                    label=r"$\|\tilde k-k_0\|_2^2$")
+    lo, hi = np.percentile(arr[:, 0], [5, 95])
+    xs = np.array([lo, hi])
+    axes[0].plot(xs, np.median(arr[:, 1] / np.maximum(arr[:, 0], 1e-12)) * xs,
+                 "k--", lw=1.1, label="slope 1")
+    axes[0].set_xscale("log")
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("held-out contrastive excess")
+    axes[0].set_ylabel("integrated squared error")
+    axes[0].set_title("calibration")
+    axes[0].legend(frameon=False, loc="lower right")
+
+    slope_lookup = {model: slope for model, slope in slopes}
+    for model in ["smooth", "rough", "multimodal"]:
+        sub = [r for r in exp3_rows if r[0] == model]
+        axes[1].errorbar([r[1] for r in sub], [r[2] for r in sub], yerr=[r[3] for r in sub],
+                         marker="o", lw=1.2, capsize=2,
+                         label="%s (%.2f)" % (model, slope_lookup[model]))
+    axes[1].set_xscale("log")
+    axes[1].set_yscale("log")
+    axes[1].set_xlabel("sample size n")
+    axes[1].set_ylabel(r"$d_{\mu,\mathrm{TV}}^2$")
+    axes[1].set_title("rate diagnostic")
+    axes[1].legend(frameon=False, title="model (slope)")
+
+    savefig(fig, "fig1_end_to_end_calibration.pdf")
+
+
 def exp4_anchor_reference(seeds):
     rows = []
     eps_list = [0.01, 0.03, 0.05, 0.1, 0.2, 0.4, 0.7]
@@ -663,7 +706,6 @@ def exp4_anchor_reference(seeds):
     axes[0].set_title("reconstruction")
     axes[1].set_title("contrastive fit")
     axes[2].set_title("de-anchor invalidity")
-    axes[2].legend(frameon=False, fontsize=6.5)
     savefig(fig, "fig4_anchor_reference.pdf")
     return rows
 
@@ -884,10 +926,26 @@ def exp7_ablation(seeds):
     baseline = np.maximum(M[0:1], 1e-8)
     Mn = M / baseline
     fig, ax = plt.subplots(figsize=(7.5, 4.3))
-    masked = np.ma.masked_invalid(np.log10(np.maximum(Mn, 1e-3)))
-    im = ax.imshow(masked, aspect="auto", cmap="magma")
+    Z = np.log10(np.maximum(Mn, 1e-3))
+    masked = np.ma.masked_invalid(Z)
+    finite = Z[np.isfinite(Z)]
+    lim = max(0.5, float(np.nanpercentile(np.abs(finite), 90))) if finite.size else 1.0
+    cmap = copy.copy(plt.get_cmap("RdBu_r"))
+    cmap.set_bad(color="#f2f2f2")
+    im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=-lim, vmax=lim)
     ax.set_yticks(range(len(rows))); ax.set_yticklabels([r[0] for r in rows])
     ax.set_xticks(range(5)); ax.set_xticklabels(["Excess", "TV", "NegMass", "RowErr", "Rollout"])
+    for i in range(Mn.shape[0]):
+        for j in range(Mn.shape[1]):
+            if not np.isfinite(Mn[i, j]):
+                ax.text(j, i, "N/A", ha="center", va="center", fontsize=6.8, color="0.45")
+            else:
+                txt = "%.2g" % Mn[i, j]
+                ax.text(j, i, txt, ha="center", va="center", fontsize=6.8, color="0.15")
+    ax.set_xticks(np.arange(-.5, 5, 1), minor=True)
+    ax.set_yticks(np.arange(-.5, len(rows), 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.7)
+    ax.tick_params(which="minor", bottom=False, left=False)
     fig.colorbar(im, ax=ax, label="log10 relative to Ours")
     ax.set_title("Real-trained ablation study")
     savefig(fig, "fig7_ablation_heatmap.pdf")
@@ -1092,6 +1150,7 @@ def main():
     exp1 = exp1_end_to_end(args.seeds)
     exp2_markovization_learned(args.seeds)
     exp3 = exp3_rates_real(args.seeds)
+    plot_statistical_diagnostics(exp1, exp3)
     exp4_anchor_reference(args.seeds)
     exp5_trajectory_real(args.seeds)
     exp6_dynamic_learned(args.seeds)
