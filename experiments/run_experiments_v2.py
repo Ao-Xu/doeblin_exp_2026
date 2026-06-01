@@ -147,13 +147,18 @@ def ref_density(Y, ref="uniform", marginal_samples=None, bandwidth=0.055):
     raise ValueError("unknown reference %s" % ref)
 
 
-def row_markovize_density(density, dy):
+def row_markovize_density(density, dy, fallback_density=None):
     positive = np.maximum(density, 0.0)
     mass = positive.sum(axis=1, keepdims=True) * dy
     out = np.empty_like(positive)
     good = mass[:, 0] > 0
     out[good] = positive[good] / mass[good]
-    out[~good] = 1.0
+    if fallback_density is None:
+        fallback_density = np.ones_like(density)
+    fallback_density = np.asarray(fallback_density, dtype=float)
+    if fallback_density.ndim == 1:
+        fallback_density = np.tile(fallback_density[None, :], (density.shape[0], 1))
+    out[~good] = fallback_density[~good]
     return out
 
 
@@ -234,10 +239,10 @@ class ReLUContrastiveNet:
             pre.append(Z)
             A = np.maximum(Z, 0.0)
             acts.append(A)
-        logits = (A.dot(self.W[-1]) + self.b[-1]).reshape(-1)
-        return logits, acts, pre
+        raw_output = (A.dot(self.W[-1]) + self.b[-1]).reshape(-1)
+        return raw_output, acts, pre
 
-    def predict_logit(self, X, batch=20000):
+    def predict_raw_output(self, X, batch=20000):
         out = []
         for i in range(0, X.shape[0], batch):
             z, _, _ = self.forward(X[i:i + batch])
@@ -251,11 +256,13 @@ class ReLUContrastiveNet:
             out.append(SCORE_GAMMA + (SCORE_GAMMA_UPPER - SCORE_GAMMA) * sigmoid(z))
         return np.concatenate(out)
 
-    def fit(self, X, y, r_values, sample_weight=None, tau=5, epochs=8,
+    def fit(self, X, y, r_values, sample_weight=None, tau=5, n_blocks=None, epochs=8,
             batch_size=512, lr=2e-3, weight_decay=1e-5):
         n = X.shape[0]
         if sample_weight is None:
             sample_weight = np.ones(n)
+        if n_blocks is None:
+            n_blocks = max(1.0, float(np.sum(sample_weight) / (1.0 + tau)))
         mW = [np.zeros_like(w) for w in self.W]
         vW = [np.zeros_like(w) for w in self.W]
         mb = [np.zeros_like(b) for b in self.b]
@@ -277,7 +284,10 @@ class ReLUContrastiveNet:
                 logits = np.log(np.maximum(a, 1e-12) / np.maximum(tau * rb, 1e-12))
                 p = sigmoid(logits)
                 da_df = (SCORE_GAMMA_UPPER - SCORE_GAMMA) * s * (1.0 - s)
-                dz = (wb * (p - yb) * da_df / np.maximum(a, 1e-12))[:, None] / np.maximum(wb.sum(), 1e-12)
+                scale = len(ids) / max(float(n), 1.0)
+                dz = (
+                    scale * wb * (p - yb) * da_df / np.maximum(a, 1e-12)
+                )[:, None] / max(float(n_blocks), 1.0)
                 gW = [None] * len(self.W)
                 gb = [None] * len(self.b)
                 gW[-1] = acts[-1].T.dot(dz) + weight_decay * self.W[-1]
@@ -324,10 +334,10 @@ def build_contrastive_data(rng, n, model="smooth", sigma=0.07, eps=0.1, tau=5,
     return Z, labels, weights, r_values
 
 
-def weighted_logistic_loss_from_scores(scores, labels, weights, r_values, tau):
+def weighted_logistic_loss_from_scores(scores, labels, weights, r_values, tau, n_blocks):
     logits = np.log(np.maximum(scores, 1e-12) / np.maximum(tau * r_values, 1e-12))
     losses = np.logaddexp(0.0, logits) - labels * logits
-    return float(np.sum(weights * losses) / np.maximum(np.sum(weights), 1e-12))
+    return float(np.sum(weights * losses) / max(float(n_blocks), 1.0))
 
 
 def heldout_contrastive_excess(net, seed, n_val=20000, model="smooth", sigma=0.07,
@@ -340,8 +350,8 @@ def heldout_contrastive_excess(net, seed, n_val=20000, model="smooth", sigma=0.0
     k = true_density_1d(X, Y[:, 0], model=model, sigma=sigma)
     a0 = (1 - eps) * k + eps * r_values
     return (
-        weighted_logistic_loss_from_scores(scores_hat, labels, weights, r_values, tau)
-        - weighted_logistic_loss_from_scores(a0, labels, weights, r_values, tau)
+        weighted_logistic_loss_from_scores(scores_hat, labels, weights, r_values, tau, n_val)
+        - weighted_logistic_loss_from_scores(a0, labels, weights, r_values, tau, n_val)
     )
 
 
@@ -353,7 +363,8 @@ def train_score(seed, n, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="unifor
     if epochs is None:
         epochs = 10 if n <= 1500 else 8 if n <= 4000 else 6
     t0 = time.time()
-    net.fit(Z, labels, r_values, sample_weight=weights, tau=tau, epochs=epochs, batch_size=512, lr=2e-3)
+    net.fit(Z, labels, r_values, sample_weight=weights, tau=tau, n_blocks=n,
+            epochs=epochs, batch_size=512, lr=2e-3)
     runtime = time.time() - t0
     return net, runtime
 
@@ -377,11 +388,11 @@ def grid_quantities(net, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="unifor
         raw = ahat
         target_density = ktrue
     if markovize:
-        khat = row_markovize_density(raw, dy)
+        khat = row_markovize_density(raw, dy, fallback_density=r)
     else:
         khat = raw
-    Ptrue = row_markovize_density(ktrue, dy) * dy
-    Pmark = row_markovize_density(raw, dy) * dy
+    Ptrue = row_markovize_density(ktrue, dy, fallback_density=r) * dy
+    Pmark = row_markovize_density(raw, dy, fallback_density=r) * dy
     Phat = khat * dy if not markovize else Pmark
     excess = np.mean(
         -a0 * np.log(np.maximum(ahat, 1e-12) / np.maximum(ahat + tau * r, 1e-12))
@@ -419,7 +430,7 @@ def timed_grid_pipeline(net, model="smooth", sigma=0.07, eps=0.1, tau=5,
     raw = (ahat - eps * r) / max(1 - eps, 1e-8)
     deanchor_time = time.perf_counter() - t1
     t2 = time.perf_counter()
-    khat = row_markovize_density(raw, dy)
+    khat = row_markovize_density(raw, dy, fallback_density=r)
     mark_time = time.perf_counter() - t2
     t3 = time.perf_counter()
     ktrue = true_density_1d(Xg, Yg[:, 0], model=model, sigma=sigma).reshape(nx, ny)
@@ -894,7 +905,8 @@ def exp8_runtime():
             data_time = time.perf_counter() - t0
             net = ReLUContrastiveNet(2, width=24, depth=2, seed=seed + 17)
             t1 = time.perf_counter()
-            net.fit(Z, labels, r_values, sample_weight=weights, tau=tau, epochs=5, batch_size=512, lr=2e-3)
+            net.fit(Z, labels, r_values, sample_weight=weights, tau=tau, n_blocks=n,
+                    epochs=5, batch_size=512, lr=2e-3)
             train_time = time.perf_counter() - t1
             score_time, deanchor_time, mark_time, metric_time, _, _, _ = timed_grid_pipeline(
                 net, model="smooth", sigma=0.07, eps=0.1, tau=tau, nx=42, ny=42
