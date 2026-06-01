@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 V2 = os.path.join(ROOT, "results_v2")
+SCORE_GAMMA = 1e-4
+SCORE_GAMMA_UPPER = 80.0
 
 
 def ensure_dir(path):
@@ -242,8 +244,18 @@ class ReLUContrastiveNet:
             out.append(z)
         return np.concatenate(out)
 
-    def fit(self, X, y, epochs=8, batch_size=512, lr=2e-3, weight_decay=1e-5):
+    def predict_score(self, X, batch=20000):
+        out = []
+        for i in range(0, X.shape[0], batch):
+            z, _, _ = self.forward(X[i:i + batch])
+            out.append(SCORE_GAMMA + (SCORE_GAMMA_UPPER - SCORE_GAMMA) * sigmoid(z))
+        return np.concatenate(out)
+
+    def fit(self, X, y, r_values, sample_weight=None, tau=5, epochs=8,
+            batch_size=512, lr=2e-3, weight_decay=1e-5):
         n = X.shape[0]
+        if sample_weight is None:
+            sample_weight = np.ones(n)
         mW = [np.zeros_like(w) for w in self.W]
         vW = [np.zeros_like(w) for w in self.W]
         mb = [np.zeros_like(b) for b in self.b]
@@ -257,9 +269,15 @@ class ReLUContrastiveNet:
                 ids = idx[start:start + batch_size]
                 xb = X[ids]
                 yb = y[ids]
-                logits, acts, pre = self.forward(xb)
+                rb = np.maximum(r_values[ids], 1e-12)
+                wb = sample_weight[ids]
+                f, acts, pre = self.forward(xb)
+                s = sigmoid(f)
+                a = SCORE_GAMMA + (SCORE_GAMMA_UPPER - SCORE_GAMMA) * s
+                logits = np.log(np.maximum(a, 1e-12) / np.maximum(tau * rb, 1e-12))
                 p = sigmoid(logits)
-                dz = (p - yb)[:, None] / len(ids)
+                da_df = (SCORE_GAMMA_UPPER - SCORE_GAMMA) * s * (1.0 - s)
+                dz = (wb * (p - yb) * da_df / np.maximum(a, 1e-12))[:, None] / np.maximum(wb.sum(), 1e-12)
                 gW = [None] * len(self.W)
                 gb = [None] * len(self.b)
                 gW[-1] = acts[-1].T.dot(dz) + weight_decay * self.W[-1]
@@ -289,42 +307,53 @@ def build_contrastive_data(rng, n, model="smooth", sigma=0.07, eps=0.1, tau=5,
     X = rng.rand(n, 1)
     Y_data = sample_kernel(rng, X, model=model, sigma=sigma)
     Y_anchor = sample_reference(rng, n, ref=ref, marginal_samples=marginal_samples)
-    use_data = (rng.rand(n, 1) < (1 - eps))
-    Y_pos = np.where(use_data, Y_data, Y_anchor)
     X_neg = np.repeat(X, tau, axis=0)
     Y_neg = sample_reference(rng, n * tau, ref=ref, marginal_samples=marginal_samples)
-    Z = np.vstack([np.hstack([X, Y_pos]), np.hstack([X_neg, Y_neg])])
-    labels = np.concatenate([np.ones(n), np.zeros(n * tau)])
-    return Z, labels
+    Z = np.vstack([
+        np.hstack([X, Y_data]),
+        np.hstack([X, Y_anchor]),
+        np.hstack([X_neg, Y_neg]),
+    ])
+    labels = np.concatenate([np.ones(n), np.ones(n), np.zeros(n * tau)])
+    weights = np.concatenate([
+        np.full(n, 1.0 - eps),
+        np.full(n, eps),
+        np.ones(n * tau),
+    ])
+    r_values = ref_density(Z[:, 1:2], ref=ref, marginal_samples=marginal_samples)
+    return Z, labels, weights, r_values
 
 
-def logistic_loss_from_logits(logits, labels):
-    return float(np.mean(np.logaddexp(0.0, logits) - labels * logits))
+def weighted_logistic_loss_from_scores(scores, labels, weights, r_values, tau):
+    logits = np.log(np.maximum(scores, 1e-12) / np.maximum(tau * r_values, 1e-12))
+    losses = np.logaddexp(0.0, logits) - labels * logits
+    return float(np.sum(weights * losses) / np.maximum(np.sum(weights), 1e-12))
 
 
 def heldout_contrastive_excess(net, seed, n_val=20000, model="smooth", sigma=0.07,
                                eps=0.1, tau=5, ref="uniform", marginal_samples=None):
     rng = np.random.RandomState(seed)
-    Z, labels = build_contrastive_data(rng, n_val, model, sigma, eps, tau, ref, marginal_samples)
-    logits_hat = np.clip(net.predict_logit(Z), -8.0, 8.0)
+    Z, labels, weights, r_values = build_contrastive_data(rng, n_val, model, sigma, eps, tau, ref, marginal_samples)
+    scores_hat = net.predict_score(Z)
     X = Z[:, 0:1]
     Y = Z[:, 1:2]
-    r = ref_density(Y, ref=ref, marginal_samples=marginal_samples)
     k = true_density_1d(X, Y[:, 0], model=model, sigma=sigma)
-    a0 = (1 - eps) * k + eps * r
-    logits_oracle = np.log(np.maximum(a0, 1e-12) / np.maximum(tau * r, 1e-12))
-    return logistic_loss_from_logits(logits_hat, labels) - logistic_loss_from_logits(logits_oracle, labels)
+    a0 = (1 - eps) * k + eps * r_values
+    return (
+        weighted_logistic_loss_from_scores(scores_hat, labels, weights, r_values, tau)
+        - weighted_logistic_loss_from_scores(a0, labels, weights, r_values, tau)
+    )
 
 
 def train_score(seed, n, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="uniform",
                 width=32, depth=2, epochs=None, marginal_samples=None):
     rng = np.random.RandomState(seed)
-    Z, labels = build_contrastive_data(rng, n, model, sigma, eps, tau, ref, marginal_samples)
+    Z, labels, weights, r_values = build_contrastive_data(rng, n, model, sigma, eps, tau, ref, marginal_samples)
     net = ReLUContrastiveNet(2, width=width, depth=depth, seed=seed + 17)
     if epochs is None:
         epochs = 10 if n <= 1500 else 8 if n <= 4000 else 6
     t0 = time.time()
-    net.fit(Z, labels, epochs=epochs, batch_size=512, lr=2e-3)
+    net.fit(Z, labels, r_values, sample_weight=weights, tau=tau, epochs=epochs, batch_size=512, lr=2e-3)
     runtime = time.time() - t0
     return net, runtime
 
@@ -337,9 +366,8 @@ def grid_quantities(net, model="smooth", sigma=0.07, eps=0.1, tau=5, ref="unifor
     Xg = np.repeat(x, ny, axis=0)
     Yg = np.tile(y, (nx, 1))
     feats = np.hstack([Xg, Yg])
-    logits = np.clip(net.predict_logit(feats), -8.0, 8.0).reshape(nx, ny)
+    ahat = net.predict_score(feats).reshape(nx, ny)
     r = ref_density(Yg.reshape(nx, ny, 1), ref=ref, marginal_samples=marginal_samples)
-    ahat = tau * r * np.exp(logits)
     ktrue = true_density_1d(Xg, Yg[:, 0], model=model, sigma=sigma).reshape(nx, ny)
     a0 = (1 - eps) * ktrue + eps * r
     if deanchor:
@@ -384,11 +412,10 @@ def timed_grid_pipeline(net, model="smooth", sigma=0.07, eps=0.1, tau=5,
     Yg = np.tile(y, (nx, 1))
     feats = np.hstack([Xg, Yg])
     t0 = time.perf_counter()
-    logits = np.clip(net.predict_logit(feats), -8.0, 8.0).reshape(nx, ny)
+    ahat = net.predict_score(feats).reshape(nx, ny)
     score_time = time.perf_counter() - t0
     r = ref_density(Yg.reshape(nx, ny, 1), ref=ref, marginal_samples=marginal_samples)
     t1 = time.perf_counter()
-    ahat = tau * r * np.exp(logits)
     raw = (ahat - eps * r) / max(1 - eps, 1e-8)
     deanchor_time = time.perf_counter() - t1
     t2 = time.perf_counter()
@@ -863,11 +890,11 @@ def exp8_runtime():
             seed = 80000 + n + tau
             rng = np.random.RandomState(seed)
             t0 = time.perf_counter()
-            Z, labels = build_contrastive_data(rng, n, model="smooth", sigma=0.07, eps=0.1, tau=tau)
+            Z, labels, weights, r_values = build_contrastive_data(rng, n, model="smooth", sigma=0.07, eps=0.1, tau=tau)
             data_time = time.perf_counter() - t0
             net = ReLUContrastiveNet(2, width=24, depth=2, seed=seed + 17)
             t1 = time.perf_counter()
-            net.fit(Z, labels, epochs=5, batch_size=512, lr=2e-3)
+            net.fit(Z, labels, r_values, sample_weight=weights, tau=tau, epochs=5, batch_size=512, lr=2e-3)
             train_time = time.perf_counter() - t1
             score_time, deanchor_time, mark_time, metric_time, _, _, _ = timed_grid_pipeline(
                 net, model="smooth", sigma=0.07, eps=0.1, tau=tau, nx=42, ny=42
@@ -1044,7 +1071,7 @@ Rare-state mass $\delta$ & $d_{\mu,\mathrm{TV}}(K,L)$ & rare-state rollout TV & 
 def main():
     global V2
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--seeds", type=int, default=10)
     parser.add_argument("--out", type=str, default=V2)
     args = parser.parse_args()
     V2 = os.path.abspath(args.out)
