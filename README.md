@@ -46,17 +46,29 @@ The public script implements the estimator described in the paper.
 
 The score bounds used in the paper runs are `gamma=1e-4` and `Gamma=80`.
 
+## Fixed Implementation Settings
+
+| Item | Submission setting |
+|---|---|
+| Score network | ReLU MLP on `(x,y)` with bounded output `a_theta = gamma + (Gamma-gamma) sigmoid(f_theta)`, `gamma=1e-4`, `Gamma=80`. The default architecture is depth `2` and width `32`; the under-capacity ablation uses width `16`, and the runtime diagnostic uses width `24`. |
+| Optimization | Adam with learning rate `2e-3`, batch size `512`, and weight decay `1e-5`. Unless explicitly varied, epochs are `10` for `n <= 1500`, `8` for `n <= 4000`, and `6` for larger `n`; selected stress tests use `7` epochs and runtime diagnostics use `5` epochs. |
+| Contrastive construction | Weighted double-positive risk with default `eps=0.1` and `tau=5`; negative-sample ablations use `tau in {1,5,15}`. |
+| Reference laws | Uniform restart law; poor-coverage stress test `0.1 Uniform + 0.9 Beta(2,8)`; empirical wrapped KDE with bandwidth `0.055`; and `0.5 Uniform + 0.5 KDE`. Samplers and density evaluators are matched. |
+| Quadrature | Continuous-state Markovization and TV diagnostics use common grids, typically `54` design points and `54` to `72` next-state points; runtime diagnostics use `42 x 42` grids. |
+| Trajectory diagnostics | Lazy finite-state chains with `alpha in {0.02,0.05,0.1,0.2,0.5}` and thinning `q in {1,2,5,10,20,50,100}`. |
+| Randomness and timing | Main Monte Carlo summaries use ten seeds. Runtime diagnostics record measured wall-clock components on the local CPU submission environment used for the paper runs; they are not systems benchmarks. |
+
 ## Experiment Index
 
 | Paper item | Interface checked | Main output files |
 |---|---|---|
 | Figure 1: statistical diagnostics | Calibration and one-dimensional rate decay | `fig1_end_to_end_calibration.pdf`, `exp1_end_to_end.csv`, `exp3_rates_dimension.csv` |
 | Figure 2: Markovization | De-anchored scores can be invalid; Markovization restores kernel validity | `fig2_markovization_learned.pdf`, `exp2_markovization.csv` |
-| Figure 4: anchor/reference | Anchor-strength and reference-coverage tradeoffs | `fig4_anchor_reference.pdf`, `exp4_anchor_reference.csv` |
-| Figure 5: trajectory stress test | Temporal dependence and thinning diagnostics | `fig5_trajectory_real.pdf`, `exp5_trajectory_real.csv`, `exp5_thinning_real.csv`, `table6_thinning_effective_sample.tex` |
-| Figure 6 and coverage table | Finite-horizon transfer and coverage failure | `fig6_dynamic_transfer_learned.pdf`, `exp6_dynamic_learned.csv`, `exp6_rare.csv`, `table7_coverage_failure.tex` |
-| Figure 7 and ablation tables | Component necessity, numerical validity, and theory coverage | `fig7_ablation_heatmap.pdf`, `table3_method_comparison.tex`, `table4_ablation.tex`, `exp7_ablation.csv` |
-| Figure 8: runtime | Measured cost of data construction, training, Markovization, and evaluation | `fig8_runtime_scalability.pdf`, `exp8_runtime.csv` |
+| Figure 3: anchor/reference | Anchor-strength and reference-coverage tradeoffs | `fig4_anchor_reference.pdf`, `exp4_anchor_reference.csv` |
+| Figure 4: trajectory stress test | Temporal dependence and thinning diagnostics | `fig5_trajectory_real.pdf`, `exp5_trajectory_real.csv`, `exp5_thinning_real.csv`, `table6_thinning_effective_sample.tex` |
+| Figure 5 and coverage table | Finite-horizon transfer and coverage failure | `fig6_dynamic_transfer_learned.pdf`, `exp6_dynamic_learned.csv`, `exp6_rare.csv`, `table7_coverage_failure.tex` |
+| Figure 6 and ablation tables | Component necessity, numerical validity, and theory coverage | `fig7_ablation_heatmap.pdf`, `table3_method_comparison.tex`, `table4_ablation.tex`, `exp7_ablation.csv` |
+| Figure 7: runtime | Measured cost of data construction, training, Markovization, and evaluation | `fig8_runtime_scalability.pdf`, `exp8_runtime.csv` |
 
 The generated files `fig3_rates_slopes.pdf`, `table1_theory_map.tex`, and
 `table2_models.tex` are retained as machine-generated provenance for the rate
@@ -80,6 +92,9 @@ paper body.
 
 - Continuous-state TV and Markovization integrals are computed by grid quadrature on
   common evaluation grids.
+- In the ablation heatmap, `Pre-M NegMass` is plotted as an absolute value on a
+  log scale because the full method has zero negative mass to numerical precision.
+  Other heatmap columns are relative to the full method.
 - Path-law TV is reported as an occupancy-weighted perturbation upper bound, not as an
   exact path-law enumeration in continuous-state experiments.
 - The trajectory experiment isolates temporal dependence; it is not a sharp
