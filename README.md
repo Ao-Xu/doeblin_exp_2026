@@ -3,15 +3,16 @@
 This directory contains the reproducible experiment pipeline for Section 8.
 The main entry point is self-contained and does not import private modules.
 
-## Setup
+## Setup from the repository root
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -r experiments/requirements.txt
 ```
 
 ## Run the submission results
 
 ```bash
+cd experiments
 python run_experiments_v2.py --out results_v2 --seeds 10
 ```
 
@@ -21,8 +22,11 @@ the paper in `results_v2/`.
 For a faster smoke test, use:
 
 ```bash
+cd experiments
 python run_experiments_v2.py --out results_quick --seeds 3
 ```
+
+If your shell is already inside `experiments/`, omit the `cd experiments` line.
 
 The training-based figures are produced from end-to-end contrastive training,
 de-anchoring, Markovization, and evaluation.  Deterministic diagnostics, such as
