@@ -50,18 +50,18 @@ The score bounds used in the paper runs are `gamma=1e-4` and `Gamma=80`.
 
 | Paper item | Interface checked | Main output files |
 |---|---|---|
-| Figure 1: calibration | Contrastive excess risk tracks anchored and de-anchored density error | `fig1_end_to_end_calibration.pdf`, `exp1_end_to_end.csv` |
+| Figure 1: statistical diagnostics | Calibration and one-dimensional rate decay | `fig1_end_to_end_calibration.pdf`, `exp1_end_to_end.csv`, `exp3_rates_dimension.csv` |
 | Figure 2: Markovization | De-anchored scores can be invalid; Markovization restores kernel validity | `fig2_markovization_learned.pdf`, `exp2_markovization.csv` |
-| Figure 3 and rate-slope table | Real-trained one-dimensional rate diagnostic | `fig3_rates_slopes.pdf`, `table5_rate_slopes.tex`, `exp3_rates_dimension.csv` |
 | Figure 4: anchor/reference | Anchor-strength and reference-coverage tradeoffs | `fig4_anchor_reference.pdf`, `exp4_anchor_reference.csv` |
 | Figure 5: trajectory stress test | Temporal dependence and thinning diagnostics | `fig5_trajectory_real.pdf`, `exp5_trajectory_real.csv`, `exp5_thinning_real.csv`, `table6_thinning_effective_sample.tex` |
 | Figure 6 and coverage table | Finite-horizon transfer and coverage failure | `fig6_dynamic_transfer_learned.pdf`, `exp6_dynamic_learned.csv`, `exp6_rare.csv`, `table7_coverage_failure.tex` |
 | Figure 7 and ablation tables | Component necessity, numerical validity, and theory coverage | `fig7_ablation_heatmap.pdf`, `table3_method_comparison.tex`, `table4_ablation.tex`, `exp7_ablation.csv` |
 | Figure 8: runtime | Measured cost of data construction, training, Markovization, and evaluation | `fig8_runtime_scalability.pdf`, `exp8_runtime.csv` |
 
-The generated files `table1_theory_map.tex` and `table2_models.tex` are retained as
-machine-generated provenance for the experiment index and model grid, but they are not
-included directly in the paper body.
+The generated files `fig3_rates_slopes.pdf`, `table1_theory_map.tex`, and
+`table2_models.tex` are retained as machine-generated provenance for the rate
+diagnostic, experiment index, and model grid, but they are not included directly in the
+paper body.
 
 ## Synthetic Models and Parameter Grids
 
