@@ -922,31 +922,43 @@ def exp7_ablation(seeds):
     write_csv("exp7_ablation.csv",
               ["variant", "excess", "tv", "negmass", "rowerr", "rollout_tv",
                "excess_se", "tv_se", "negmass_se", "rowerr_se", "rollout_se"], rows)
-    M = np.array([[r[1], r[2], max(r[3], 1e-8), max(r[4], 1e-8), r[5] if np.isfinite(r[5]) else np.nan] for r in rows])
+    M = np.array([[r[1], r[2], r[3], r[4], r[5] if np.isfinite(r[5]) else np.nan] for r in rows])
+    rel_cols = [0, 1, 3, 4]
     baseline = np.maximum(M[0:1], 1e-8)
-    Mn = M / baseline
+    display = np.full_like(M, np.nan, dtype=float)
+    labels = np.empty(M.shape, dtype=object)
+    for i in range(M.shape[0]):
+        for j in range(M.shape[1]):
+            if not np.isfinite(M[i, j]):
+                labels[i, j] = "N/A"
+            elif j == 2:
+                display[i, j] = np.log10(max(M[i, j], 1e-8))
+                labels[i, j] = "0" if M[i, j] == 0 else "%.1e" % M[i, j]
+            elif j in rel_cols:
+                rel = M[i, j] / baseline[0, j]
+                display[i, j] = np.log10(max(rel, 1e-3))
+                labels[i, j] = "%.2g" % rel
     fig, ax = plt.subplots(figsize=(7.5, 4.3))
-    Z = np.log10(np.maximum(Mn, 1e-3))
-    masked = np.ma.masked_invalid(Z)
-    finite = Z[np.isfinite(Z)]
-    lim = max(0.5, float(np.nanpercentile(np.abs(finite), 90))) if finite.size else 1.0
+    masked = np.ma.masked_invalid(display)
+    finite = display[np.isfinite(display)]
+    vmax = max(1.0, float(np.nanpercentile(finite[finite >= 0], 90))) if np.any(finite >= 0) else 1.0
+    vmin = min(-4.0, float(np.nanpercentile(finite, 5))) if finite.size else -4.0
     cmap = copy.copy(plt.get_cmap("RdBu_r"))
     cmap.set_bad(color="#f2f2f2")
-    im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=-lim, vmax=lim)
+    im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
     ax.set_yticks(range(len(rows))); ax.set_yticklabels([r[0] for r in rows])
-    ax.set_xticks(range(5)); ax.set_xticklabels(["Excess", "TV", "NegMass", "RowErr", "Rollout"])
-    for i in range(Mn.shape[0]):
-        for j in range(Mn.shape[1]):
-            if not np.isfinite(Mn[i, j]):
+    ax.set_xticks(range(5)); ax.set_xticklabels(["Excess", "TV", "NegMass\n(abs)", "RowErr", "Rollout"])
+    for i in range(M.shape[0]):
+        for j in range(M.shape[1]):
+            if labels[i, j] == "N/A":
                 ax.text(j, i, "N/A", ha="center", va="center", fontsize=6.8, color="0.45")
             else:
-                txt = "%.2g" % Mn[i, j]
-                ax.text(j, i, txt, ha="center", va="center", fontsize=6.8, color="0.15")
+                ax.text(j, i, labels[i, j], ha="center", va="center", fontsize=6.8, color="0.15")
     ax.set_xticks(np.arange(-.5, 5, 1), minor=True)
     ax.set_yticks(np.arange(-.5, len(rows), 1), minor=True)
     ax.grid(which="minor", color="white", linewidth=0.7)
     ax.tick_params(which="minor", bottom=False, left=False)
-    fig.colorbar(im, ax=ax, label="log10 relative to Ours")
+    fig.colorbar(im, ax=ax, label="log10 scale: relative to Ours except absolute NegMass")
     ax.set_title("Real-trained ablation study")
     savefig(fig, "fig7_ablation_heatmap.pdf")
     return rows
@@ -1114,7 +1126,7 @@ Dynamics & learned contrastive kernels and rare-state failures & horizons $1$--$
                      (r[0], fmt(r[1]), fmt(r[2]), neg, row,
                       numerical.get(r[0], "Yes"), theory_cov.get(r[0], "Yes"), fmt(r[5])))
     lines += [r"\bottomrule", r"\end{tabular}", r"}",
-              r"\caption{Ablation summary from real-trained variants.  Pre-M NegMass and Pre-M RowErr refer only to the de-anchored score before Markovization.  N/A means that the corresponding pre-Markovization diagnostic or rollout is not defined for that ablation.  Numerical validity is separated from coverage by the anchored-chart theory.  The no-Markov row is not rolled out because it is not a valid transition kernel.}",
+              r"\caption{Ablation summary from real-trained variants.  Pre-M NegMass and Pre-M RowErr refer only to the de-anchored score before Markovization.  N/A means that the corresponding pre-Markovization diagnostic or rollout is not defined for that ablation.  Ours has zero Pre-M NegMass to numerical precision in this run.  Numerical validity is separated from coverage by the anchored-chart theory.  The no-Markov row is not rolled out because it is not a valid transition kernel.}",
               r"\label{tab:ablation-summary}", r"\end{table}"]
     with open(os.path.join(V2, "table4_ablation.tex"), "w") as f:
         f.write("\n".join(lines))
